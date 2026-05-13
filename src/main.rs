@@ -32,6 +32,7 @@ enum CliAgent {
     #[default]
     ClaudeCode,
     Opencode,
+    CopilotCli,
 }
 
 #[derive(Subcommand)]
@@ -41,6 +42,11 @@ enum Commands {
         /// Agent type
         #[arg(long, value_enum, default_value_t = CliAgent::ClaudeCode)]
         agent: CliAgent,
+        /// Hook event name. Required for `--agent copilot-cli`, since Copilot
+        /// CLI passes the event name as the command argument rather than in
+        /// the JSON payload. Ignored for other agents.
+        #[arg(long)]
+        event: Option<String>,
     },
     /// Manage hook installation
     Hooks {
@@ -157,12 +163,13 @@ fn main() -> ExitCode {
             run_dashboard(cli.theme, cli.continue_session);
             ExitCode::SUCCESS
         }
-        Some(Commands::Hook { agent }) => {
+        Some(Commands::Hook { agent, event }) => {
             let agent_str = match agent {
                 CliAgent::ClaudeCode => "claude-code",
                 CliAgent::Opencode => "opencode",
+                CliAgent::CopilotCli => "copilot-cli",
             };
-            handle_hook(agent_str)
+            handle_hook(agent_str, event.as_deref())
         }
         Some(Commands::Hooks { action }) => {
             match action {
@@ -174,6 +181,12 @@ fn main() -> ExitCode {
                         }
                     }
                     CliAgent::ClaudeCode => hooks_manage::install(),
+                    CliAgent::CopilotCli => {
+                        if let Err(e) = dot_agent_deck::copilot_manage::install() {
+                            eprintln!("Failed to install Copilot CLI hooks: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                 },
                 HooksAction::Uninstall { agent } => match agent {
                     CliAgent::Opencode => {
@@ -183,6 +196,12 @@ fn main() -> ExitCode {
                         }
                     }
                     CliAgent::ClaudeCode => hooks_manage::uninstall(),
+                    CliAgent::CopilotCli => {
+                        if let Err(e) = dot_agent_deck::copilot_manage::uninstall() {
+                            eprintln!("Failed to uninstall Copilot CLI hooks: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                 },
             }
             ExitCode::SUCCESS
@@ -405,6 +424,7 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     // Auto-install hooks for detected agents (silent, best-effort)
     hooks_manage::auto_install();
     dot_agent_deck::opencode_manage::auto_install();
+    dot_agent_deck::copilot_manage::auto_install();
 
     let effective_theme = cli_theme.unwrap_or(config.theme);
     // Detect terminal theme *before* raw mode / alternate screen takes over.

@@ -2,6 +2,7 @@ pub mod ascii_art;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;
+pub mod copilot_manage;
 pub mod daemon;
 pub mod embedded_pane;
 pub mod error;

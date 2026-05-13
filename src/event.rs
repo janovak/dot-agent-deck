@@ -24,6 +24,7 @@ pub enum EventType {
 pub enum AgentType {
     ClaudeCode,
     OpenCode,
+    CopilotCli,
     None,
 }
 

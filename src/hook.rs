@@ -37,7 +37,24 @@ struct OpenCodeHookInput {
     _extra: HashMap<String, Value>,
 }
 
-pub fn handle_hook(agent: &str) -> ExitCode {
+#[derive(Debug, Deserialize)]
+struct CopilotCliHookInput {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    cwd: Option<String>,
+    #[serde(rename = "toolName")]
+    tool_name: Option<String>,
+    #[serde(rename = "toolArgs")]
+    tool_args: Option<Value>,
+    reason: Option<String>,
+    prompt: Option<String>,
+    #[serde(rename = "userPrompt")]
+    user_prompt: Option<String>,
+    #[serde(flatten)]
+    _extra: HashMap<String, Value>,
+}
+
+pub fn handle_hook(agent: &str, event_name: Option<&str>) -> ExitCode {
     let input = match read_stdin() {
         Some(s) if !s.is_empty() => s,
         _ => return ExitCode::SUCCESS,
@@ -50,6 +67,19 @@ pub fn handle_hook(agent: &str) -> ExitCode {
                 Err(_) => return ExitCode::SUCCESS,
             };
             build_opencode_event(hook_input)
+        }
+        "copilot-cli" => {
+            // Copilot CLI passes the event name as argv to the hook script
+            // (not inside the JSON payload).
+            let event_name = match event_name {
+                Some(e) => e,
+                None => return ExitCode::SUCCESS,
+            };
+            let hook_input: CopilotCliHookInput = match serde_json::from_str(&input) {
+                Ok(v) => v,
+                Err(_) => return ExitCode::SUCCESS,
+            };
+            build_copilot_event(event_name, hook_input)
         }
         _ => {
             let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
@@ -246,6 +276,119 @@ pub fn send_to_socket(json: &str) -> Option<()> {
     stream.write_all(msg.as_bytes()).ok()?;
     stream.flush().ok()?;
     Some(())
+}
+
+// ---------------------------------------------------------------------------
+// GitHub Copilot CLI hook integration
+// ---------------------------------------------------------------------------
+//
+// Copilot CLI fires hooks declared in `~/.copilot/hooks/*.json` and passes the
+// event name as the *command argument*, not in the JSON payload (cf. the
+// constellation integration). The stdin payload uses camelCase field names
+// (`sessionId`, `toolName`, `toolArgs`, etc.).
+//
+// `dot-agent-deck hook --agent copilot-cli --event <eventName>` decodes the
+// payload and forwards a normalised `AgentEvent` to the daemon.
+
+fn map_copilot_event_type(hook_event_name: &str, reason: Option<&str>) -> Option<EventType> {
+    match hook_event_name {
+        "sessionStart" => Some(EventType::SessionStart),
+        // Copilot fires `sessionEnd` with `reason: "complete"` at the end of
+        // every conversation turn (not actually session end). Treat that as
+        // `Idle`; treat other reasons (or absent reason) as a true session end.
+        "sessionEnd" => {
+            if reason == Some("complete") {
+                Some(EventType::Idle)
+            } else {
+                Some(EventType::SessionEnd)
+            }
+        }
+        "userPromptSubmitted" => Some(EventType::Thinking),
+        "preToolUse" => Some(EventType::ToolStart),
+        "postToolUse" => Some(EventType::ToolEnd),
+        "errorOccurred" => Some(EventType::Error),
+        "agentStop" => Some(EventType::Idle),
+        "subagentStart" => Some(EventType::SubagentStart),
+        "subagentStop" => Some(EventType::SubagentStop),
+        "preCompact" => Some(EventType::Compacting),
+        _ => None,
+    }
+}
+
+fn extract_copilot_tool_detail(
+    tool_name: Option<&str>,
+    tool_args: Option<&Value>,
+) -> Option<String> {
+    let input = tool_args?.as_object()?;
+    let detail = match tool_name? {
+        "shell" | "bash" | "Bash" => {
+            let cmd = input.get("command")?.as_str()?;
+            let first_line = cmd.lines().next().unwrap_or(cmd);
+            truncate(first_line, 120)
+        }
+        "str-replace-editor" | "str_replace_editor" | "edit" | "view" | "create" | "write" => input
+            .get("path")
+            .or_else(|| input.get("file_path"))?
+            .as_str()?
+            .to_string(),
+        "grep" | "glob" => input.get("pattern")?.as_str()?.to_string(),
+        _ => {
+            let val = input.values().find_map(|v| v.as_str())?;
+            truncate(val, 80)
+        }
+    };
+    Some(detail)
+}
+
+fn build_copilot_event(event_name: &str, input: CopilotCliHookInput) -> Option<AgentEvent> {
+    let CopilotCliHookInput {
+        session_id,
+        cwd,
+        tool_name,
+        tool_args,
+        reason,
+        prompt,
+        user_prompt,
+        _extra: _,
+    } = input;
+
+    let event_type = map_copilot_event_type(event_name, reason.as_deref())?;
+
+    // Older Copilot CLI versions may omit `sessionId`; synthesise a stable
+    // per-pane fallback so the dashboard still has *something* to key on.
+    let session_id = session_id.unwrap_or_else(|| {
+        std::env::var("DOT_AGENT_DECK_PANE_ID")
+            .map(|pid| format!("copilot-pane-{pid}"))
+            .unwrap_or_else(|_| format!("copilot-{}", Utc::now().timestamp_millis()))
+    });
+
+    let tool_detail = extract_copilot_tool_detail(tool_name.as_deref(), tool_args.as_ref());
+    let user_prompt_text = prompt.or(user_prompt).map(|p| truncate(&p, 200));
+    let pane_id = std::env::var("DOT_AGENT_DECK_PANE_ID").ok();
+
+    let mut metadata = HashMap::new();
+    // Store full bash command for reactive pane routing (tool_detail truncates).
+    if matches!(event_type, EventType::ToolStart)
+        && let Some(tname) = tool_name.as_deref()
+        && matches!(tname, "shell" | "bash" | "Bash")
+        && let Some(ref args) = tool_args
+        && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
+    {
+        metadata.insert("bash_command".to_string(), cmd.to_string());
+    }
+
+    Some(AgentEvent {
+        session_id,
+        agent_type: AgentType::CopilotCli,
+        event_type,
+        tool_name,
+        tool_detail,
+        cwd,
+        timestamp: Utc::now(),
+        user_prompt: user_prompt_text,
+        metadata,
+        pane_id,
+    })
 }
 
 #[cfg(test)]
@@ -812,5 +955,256 @@ mod tests {
             event.metadata.get("bash_command").map(String::as_str),
             Some(full_cmd),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // GitHub Copilot CLI hook parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_copilot_session_start() {
+        assert_eq!(
+            map_copilot_event_type("sessionStart", None),
+            Some(EventType::SessionStart)
+        );
+    }
+
+    #[test]
+    fn map_copilot_pre_tool_use() {
+        assert_eq!(
+            map_copilot_event_type("preToolUse", None),
+            Some(EventType::ToolStart)
+        );
+    }
+
+    #[test]
+    fn map_copilot_post_tool_use() {
+        assert_eq!(
+            map_copilot_event_type("postToolUse", None),
+            Some(EventType::ToolEnd)
+        );
+    }
+
+    #[test]
+    fn map_copilot_user_prompt_is_thinking() {
+        assert_eq!(
+            map_copilot_event_type("userPromptSubmitted", None),
+            Some(EventType::Thinking)
+        );
+    }
+
+    #[test]
+    fn map_copilot_agent_stop_is_idle() {
+        assert_eq!(
+            map_copilot_event_type("agentStop", None),
+            Some(EventType::Idle)
+        );
+    }
+
+    #[test]
+    fn map_copilot_error_event() {
+        assert_eq!(
+            map_copilot_event_type("errorOccurred", None),
+            Some(EventType::Error)
+        );
+    }
+
+    #[test]
+    fn map_copilot_subagent_events() {
+        assert_eq!(
+            map_copilot_event_type("subagentStart", None),
+            Some(EventType::SubagentStart)
+        );
+        assert_eq!(
+            map_copilot_event_type("subagentStop", None),
+            Some(EventType::SubagentStop)
+        );
+    }
+
+    #[test]
+    fn map_copilot_pre_compact() {
+        assert_eq!(
+            map_copilot_event_type("preCompact", None),
+            Some(EventType::Compacting)
+        );
+    }
+
+    #[test]
+    fn map_copilot_session_end_complete_is_idle() {
+        // Copilot fires sessionEnd with reason=complete after each turn;
+        // treat that as Idle so the session card doesn't disappear.
+        assert_eq!(
+            map_copilot_event_type("sessionEnd", Some("complete")),
+            Some(EventType::Idle)
+        );
+    }
+
+    #[test]
+    fn map_copilot_session_end_other_reason_is_real_end() {
+        assert_eq!(
+            map_copilot_event_type("sessionEnd", Some("logout")),
+            Some(EventType::SessionEnd)
+        );
+        assert_eq!(
+            map_copilot_event_type("sessionEnd", None),
+            Some(EventType::SessionEnd)
+        );
+    }
+
+    #[test]
+    fn map_copilot_unknown_returns_none() {
+        assert_eq!(map_copilot_event_type("somethingElse", None), None);
+    }
+
+    #[test]
+    fn extract_copilot_tool_detail_shell() {
+        let input: Value = serde_json::json!({"command": "git status\necho hi"});
+        let detail = extract_copilot_tool_detail(Some("shell"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("git status"));
+    }
+
+    #[test]
+    fn extract_copilot_tool_detail_str_replace_editor() {
+        let input: Value = serde_json::json!({"path": "C:\\code\\foo.rs", "old": "a", "new": "b"});
+        let detail = extract_copilot_tool_detail(Some("str-replace-editor"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("C:\\code\\foo.rs"));
+    }
+
+    #[test]
+    fn extract_copilot_tool_detail_view() {
+        let input: Value = serde_json::json!({"path": "/src/main.rs"});
+        let detail = extract_copilot_tool_detail(Some("view"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("/src/main.rs"));
+    }
+
+    #[test]
+    fn extract_copilot_tool_detail_grep() {
+        let input: Value = serde_json::json!({"pattern": "TODO"});
+        let detail = extract_copilot_tool_detail(Some("grep"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("TODO"));
+    }
+
+    #[test]
+    fn extract_copilot_tool_detail_unknown_first_string() {
+        let input: Value = serde_json::json!({"unknown_field": "interesting value"});
+        let detail = extract_copilot_tool_detail(Some("mystery-tool"), Some(&input));
+        assert_eq!(detail.as_deref(), Some("interesting value"));
+    }
+
+    #[test]
+    fn build_copilot_event_session_start() {
+        let input = CopilotCliHookInput {
+            session_id: Some("cp-abc".into()),
+            cwd: Some("C:\\proj".into()),
+            tool_name: None,
+            tool_args: None,
+            reason: None,
+            prompt: None,
+            user_prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_copilot_event("sessionStart", input).unwrap();
+        assert_eq!(event.session_id, "cp-abc");
+        assert_eq!(event.agent_type, AgentType::CopilotCli);
+        assert_eq!(event.event_type, EventType::SessionStart);
+        assert_eq!(event.cwd.as_deref(), Some("C:\\proj"));
+    }
+
+    #[test]
+    fn build_copilot_event_pre_tool_use_with_shell_detail_and_full_command() {
+        let full_cmd = "cargo test --release --quiet";
+        let input = CopilotCliHookInput {
+            session_id: Some("cp-1".into()),
+            cwd: None,
+            tool_name: Some("shell".into()),
+            tool_args: Some(serde_json::json!({"command": full_cmd})),
+            reason: None,
+            prompt: None,
+            user_prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_copilot_event("preToolUse", input).unwrap();
+        assert_eq!(event.event_type, EventType::ToolStart);
+        assert_eq!(event.tool_name.as_deref(), Some("shell"));
+        assert_eq!(event.tool_detail.as_deref(), Some(full_cmd));
+        assert_eq!(
+            event.metadata.get("bash_command").map(String::as_str),
+            Some(full_cmd)
+        );
+    }
+
+    #[test]
+    fn build_copilot_event_session_end_complete_is_idle() {
+        let input = CopilotCliHookInput {
+            session_id: Some("cp-1".into()),
+            cwd: None,
+            tool_name: None,
+            tool_args: None,
+            reason: Some("complete".into()),
+            prompt: None,
+            user_prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_copilot_event("sessionEnd", input).unwrap();
+        assert_eq!(event.event_type, EventType::Idle);
+    }
+
+    #[test]
+    fn build_copilot_event_unknown_returns_none() {
+        let input = CopilotCliHookInput {
+            session_id: Some("cp-1".into()),
+            cwd: None,
+            tool_name: None,
+            tool_args: None,
+            reason: None,
+            prompt: None,
+            user_prompt: None,
+            _extra: HashMap::new(),
+        };
+        assert!(build_copilot_event("notAnEvent", input).is_none());
+    }
+
+    #[test]
+    fn deserialize_copilot_hook_input_camel_case() {
+        let json = r#"{
+            "sessionId": "cp-xyz",
+            "cwd": "C:\\Users\\jonovak\\proj",
+            "toolName": "view",
+            "toolArgs": {"path": "src/main.rs"},
+            "transcriptPath": "/tmp/transcript.json"
+        }"#;
+        let input: CopilotCliHookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id.as_deref(), Some("cp-xyz"));
+        assert_eq!(input.tool_name.as_deref(), Some("view"));
+        assert!(input.tool_args.is_some());
+    }
+
+    #[test]
+    fn build_copilot_event_fallback_session_id_from_pane() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let key = "DOT_AGENT_DECK_PANE_ID";
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, "pane-7") };
+
+        let input = CopilotCliHookInput {
+            session_id: None, // Older Copilot didn't include sessionId
+            cwd: None,
+            tool_name: None,
+            tool_args: None,
+            reason: None,
+            prompt: None,
+            user_prompt: None,
+            _extra: HashMap::new(),
+        };
+        let event = build_copilot_event("sessionStart", input).unwrap();
+        assert_eq!(event.session_id, "copilot-pane-pane-7");
+        assert_eq!(event.pane_id.as_deref(), Some("pane-7"));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }
