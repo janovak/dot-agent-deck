@@ -1327,6 +1327,101 @@ fn strip_paste_trailing_newlines(text: &str) -> &str {
     text.trim_end_matches(['\r', '\n'])
 }
 
+/// Same as `strip_paste_trailing_newlines` but operates on bytes —
+/// used by the keystroke-burst flush path where the buffered payload
+/// is `Vec<u8>` rather than `&str`.
+fn strip_paste_trailing_newlines_bytes(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == b'\r' || bytes[end - 1] == b'\n') {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+/// Flush a buffered burst of PaneInput keystrokes to the focused pane.
+///
+/// A burst is built up when several printable Char / Enter events arrive
+/// in a single event-drain cycle (the typical pattern when a terminal
+/// emulator feeds clipboard-paste content into the input queue as
+/// individual key presses, instead of as a single `Event::Paste`). This
+/// is the fallback for terminals that don't generate `Event::Paste` —
+/// Windows Terminal in some configurations behaves this way.
+///
+/// When the burst is small (1 key), it's a normal keystroke — written
+/// raw. When the burst is larger (≥ 2 keys), it's almost certainly a
+/// paste:
+///   * Trailing CR/LF is stripped so the paste does not auto-submit.
+///   * If the focused pane runs a known agent (advertised bracketed
+///     paste, override-listed `AgentType`, or its launch command is a
+///     known agent CLI), the payload is wrapped in `␛[200~ … ␛[201~`
+///     bracketed-paste markers so internal newlines are treated as
+///     content rather than per-line submits.
+///   * A status-bar diagnostic shows the size and mode (bracketed/raw).
+///
+/// On exit the burst buffer is always emptied.
+fn flush_pane_input_burst(
+    burst: &mut Vec<u8>,
+    burst_keys: &mut usize,
+    embedded: &EmbeddedPaneController,
+    pane_id: &str,
+    ui: &mut UiState,
+    snapshot: &AppState,
+) {
+    if burst.is_empty() {
+        *burst_keys = 0;
+        return;
+    }
+    embedded.reset_scrollback(pane_id);
+
+    let is_paste = *burst_keys >= 2;
+    let payload: Vec<u8> = if is_paste {
+        let stripped = strip_paste_trailing_newlines_bytes(burst);
+        let advertised_bracketed = embedded
+            .get_screen(pane_id)
+            .and_then(|s| s.lock().ok().map(|p| p.screen().bracketed_paste()))
+            .unwrap_or(false);
+        let agent_force_bracketed = snapshot
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some(pane_id))
+            .map(|s| should_force_bracketed_paste(&s.agent_type))
+            .unwrap_or(false);
+        let command_force_bracketed = ui
+            .pane_metadata
+            .get(pane_id)
+            .map(|m| command_indicates_bracketed_paste_agent(&m.command))
+            .unwrap_or(false);
+        let use_bracketed =
+            advertised_bracketed || agent_force_bracketed || command_force_bracketed;
+        let mut payload = Vec::with_capacity(stripped.len() + 14);
+        if use_bracketed {
+            payload.extend_from_slice(b"\x1b[200~");
+        }
+        payload.extend_from_slice(stripped);
+        if use_bracketed {
+            payload.extend_from_slice(b"\x1b[201~");
+        }
+        ui.status_message = Some((
+            format!(
+                "Pasted {} chars ({}) [{} keys]",
+                stripped.len(),
+                if use_bracketed { "bracketed" } else { "raw" },
+                burst_keys,
+            ),
+            std::time::Instant::now(),
+        ));
+        payload
+    } else {
+        // Single keystroke — same behaviour as before burst-detection.
+        burst.clone()
+    };
+    if let Err(e) = embedded.write_raw_bytes(pane_id, &payload) {
+        ui.status_message = Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
+    }
+    burst.clear();
+    *burst_keys = 0;
+}
+
 /// Copy text to the system clipboard using the OSC 52 escape sequence.
 /// Writes directly to the controlling terminal (`/dev/tty` on Unix,
 /// `CONOUT$` on Windows) to bypass ratatui's buffered terminal output.
@@ -2462,6 +2557,19 @@ pub fn run_tui(
         if !crossterm::event::poll(std::time::Duration::from_millis(16))? {
             continue;
         }
+
+        // PaneInput keystroke buffer for paste detection. A clipboard paste
+        // floods many KeyEvents into a single drain iteration; normal typing
+        // produces 1 per drain. We accumulate burst-capable keys (printable
+        // Char and Enter without Ctrl/Alt) into `pane_input_burst` and flush
+        // once the drain ends. If `pane_input_burst_keys >= 2`, the flush
+        // treats the burst as a paste (strips trailing CR/LF so it doesn't
+        // auto-submit, and wraps in bracketed-paste markers when the focused
+        // pane is a known agent). This is the fallback path for terminals
+        // that don't generate `Event::Paste` for clipboard-pastes (notably
+        // Windows Terminal in some configurations).
+        let mut pane_input_burst: Vec<u8> = Vec::new();
+        let mut pane_input_burst_keys: usize = 0;
 
         // Process events in a tight loop until the queue is empty.
         loop {
@@ -3627,10 +3735,37 @@ pub fn run_tui(
                     }
                 }
                 KeyResult::ForwardToPane(bytes) => {
-                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                    // Decide whether this key should be batched into a
+                    // paste-burst buffer or written immediately. Burst-capable
+                    // keys are plain printable Char and Enter without
+                    // Ctrl/Alt — exactly the kinds of keystrokes that arrive
+                    // when a terminal feeds clipboard text into the input
+                    // queue as individual key presses (Windows Terminal does
+                    // this even when bracketed-paste mode is enabled, in
+                    // which case `Event::Paste` never fires).
+                    let burstable = ui.mode == UiMode::PaneInput
+                        && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT);
+                    if burstable {
+                        pane_input_burst.extend_from_slice(&bytes);
+                        pane_input_burst_keys += 1;
+                    } else if let Some(embedded) =
+                        pane.as_any().downcast_ref::<EmbeddedPaneController>()
                         && let Some(pane_id) = embedded.focused_pane_id()
                     {
-                        // Reset scrollback to live output on any keystroke.
+                        // Non-burstable key (Ctrl+X, arrows, function keys,
+                        // etc.) — flush any pending burst first so paste-text
+                        // and the editing key arrive in the right order, then
+                        // write this key immediately.
+                        flush_pane_input_burst(
+                            &mut pane_input_burst,
+                            &mut pane_input_burst_keys,
+                            embedded,
+                            &pane_id,
+                            &mut ui,
+                            &snapshot,
+                        );
                         embedded.reset_scrollback(&pane_id);
                         if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
                             ui.status_message =
@@ -3663,6 +3798,25 @@ pub fn run_tui(
                 break;
             }
         } // end inner event-drain loop
+
+        // Flush any pending PaneInput keystroke burst as a single PTY write.
+        // If the burst has 2+ keys it's treated as a paste (trailing CR/LF
+        // stripped so it doesn't auto-submit; wrapped in bracketed-paste
+        // markers when the focused pane is a known agent). Single-key
+        // bursts are written as raw bytes — same behaviour as before the
+        // burst-detection path existed.
+        if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+            && let Some(pane_id) = embedded.focused_pane_id()
+        {
+            flush_pane_input_burst(
+                &mut pane_input_burst,
+                &mut pane_input_burst_keys,
+                embedded,
+                &pane_id,
+                &mut ui,
+                &snapshot,
+            );
+        }
     }
 
     // Snapshot the session for --continue restore *before* tearing down mode
@@ -8895,5 +9049,28 @@ mod tests {
         assert_eq!(strip_paste_trailing_newlines("\n\n\n"), "");
         assert_eq!(strip_paste_trailing_newlines("\r\n"), "");
         assert_eq!(strip_paste_trailing_newlines(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // Byte-flavoured variant used by the keystroke-burst flush path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_paste_bytes_matches_str_variant() {
+        assert_eq!(strip_paste_trailing_newlines_bytes(b"hello\n"), b"hello");
+        assert_eq!(strip_paste_trailing_newlines_bytes(b"hello\r\n"), b"hello");
+        assert_eq!(
+            strip_paste_trailing_newlines_bytes(b"line1\nline2\n"),
+            b"line1\nline2"
+        );
+        assert_eq!(strip_paste_trailing_newlines_bytes(b"hello"), b"hello");
+        assert_eq!(strip_paste_trailing_newlines_bytes(b""), b"");
+        assert_eq!(strip_paste_trailing_newlines_bytes(b"\n\n\n"), b"");
+        // Bytes-only edge case: non-UTF8 trailing data is preserved through
+        // the strip (we only ever drop ASCII CR/LF).
+        assert_eq!(
+            strip_paste_trailing_newlines_bytes(b"\xff\xfe\n"),
+            b"\xff\xfe"
+        );
     }
 }
