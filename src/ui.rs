@@ -1279,6 +1279,16 @@ fn should_force_bracketed_paste(agent_type: &AgentType) -> bool {
     }
 }
 
+/// Strip trailing `\r`/`\n` from a pasted payload so the paste never
+/// auto-submits. The user is expected to press Enter explicitly after
+/// the paste. Internal newlines are preserved so multi-line content
+/// remains intact (bracketed-paste mode keeps them as content; in raw
+/// mode each internal newline still triggers a submit, but the *last*
+/// line at least waits for the user).
+fn strip_paste_trailing_newlines(text: &str) -> &str {
+    text.trim_end_matches(['\r', '\n'])
+}
+
 /// Copy text to the system clipboard using the OSC 52 escape sequence.
 /// Writes directly to the controlling terminal (`/dev/tty` on Unix,
 /// `CONOUT$` on Windows) to bypass ratatui's buffered terminal output.
@@ -2836,11 +2846,20 @@ pub fn run_tui(
                         .map(|s| should_force_bracketed_paste(&s.agent_type))
                         .unwrap_or(false);
                     let use_bracketed = advertised_bracketed || agent_force_bracketed;
+
+                    // Strip trailing CR/LF so a paste never auto-submits — the
+                    // user must press Enter explicitly afterwards. This applies
+                    // regardless of bracketed-paste support: many agent CLIs
+                    // (Copilot CLI, claude, opencode) treat the trailing newline
+                    // of a clipboard paste as "submit", which is almost never
+                    // what the user wants.
+                    let body = strip_paste_trailing_newlines(&text);
+
                     let mut payload = Vec::new();
                     if use_bracketed {
                         payload.extend_from_slice(b"\x1b[200~");
                     }
-                    payload.extend_from_slice(text.as_bytes());
+                    payload.extend_from_slice(body.as_bytes());
                     if use_bracketed {
                         payload.extend_from_slice(b"\x1b[201~");
                     }
@@ -8718,5 +8737,49 @@ mod tests {
         // Plain shell panes (cmd, powershell, bash with no PS1 wrapper) — wrapping
         // here would corrupt input by inserting literal `␛[200~` text.
         assert!(!should_force_bracketed_paste(&AgentType::None));
+    }
+
+    // -----------------------------------------------------------------------
+    // Paste trailing-newline strip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_paste_removes_single_trailing_lf() {
+        assert_eq!(strip_paste_trailing_newlines("hello\n"), "hello");
+    }
+
+    #[test]
+    fn strip_paste_removes_crlf() {
+        assert_eq!(strip_paste_trailing_newlines("hello\r\n"), "hello");
+    }
+
+    #[test]
+    fn strip_paste_removes_multiple_trailing_newlines() {
+        // Copying from a text editor sometimes appends multiple blank lines.
+        assert_eq!(strip_paste_trailing_newlines("hello\n\n\n"), "hello");
+        assert_eq!(strip_paste_trailing_newlines("hello\r\n\r\n"), "hello");
+    }
+
+    #[test]
+    fn strip_paste_preserves_internal_newlines() {
+        // Multi-line snippets must keep their interior structure; only the
+        // final newline (which would trigger auto-submit) is removed.
+        assert_eq!(
+            strip_paste_trailing_newlines("line1\nline2\nline3\n"),
+            "line1\nline2\nline3"
+        );
+    }
+
+    #[test]
+    fn strip_paste_no_trailing_newline_is_unchanged() {
+        assert_eq!(strip_paste_trailing_newlines("hello"), "hello");
+        assert_eq!(strip_paste_trailing_newlines("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn strip_paste_only_newlines_becomes_empty() {
+        assert_eq!(strip_paste_trailing_newlines("\n\n\n"), "");
+        assert_eq!(strip_paste_trailing_newlines("\r\n"), "");
+        assert_eq!(strip_paste_trailing_newlines(""), "");
     }
 }
