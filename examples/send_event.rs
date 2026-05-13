@@ -1,9 +1,9 @@
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 
 use dot_agent_deck::config::socket_path;
+use dot_agent_deck::ipc;
 
-fn send(stream: &mut UnixStream, json: &str) {
+fn send(stream: &mut ipc::SyncStream, json: &str) {
     writeln!(stream, "{json}").unwrap();
     println!("Sent: {json}");
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -13,8 +13,7 @@ fn main() {
     let path = socket_path();
     println!("Connecting to {}...", path.display());
 
-    let mut stream =
-        UnixStream::connect(&path).expect("Failed to connect — is the daemon running?");
+    let mut stream = ipc::connect_sync(&path).expect("Failed to connect — is the daemon running?");
 
     let now = chrono::Utc::now();
     let ts = |offset_secs: i64| -> String {

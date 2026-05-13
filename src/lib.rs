@@ -10,6 +10,7 @@ pub mod hook;
 pub mod hooks_manage;
 pub mod hyperlink;
 pub mod init;
+pub mod ipc;
 pub mod llm;
 pub mod mode_manager;
 pub mod opencode_manage;

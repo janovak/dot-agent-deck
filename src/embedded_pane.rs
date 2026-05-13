@@ -241,6 +241,37 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Cross-platform default-shell selection used when no explicit command is
+/// supplied for a new pane. Prefers `$SHELL` if set on either platform; on
+/// Windows falls back to `%ComSpec%` and then `cmd.exe`; on Unix falls back
+/// to `/bin/sh`.
+fn default_shell() -> String {
+    if let Ok(shell) = std::env::var("SHELL")
+        && !shell.is_empty()
+    {
+        return shell;
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(com_spec) = std::env::var("ComSpec")
+            && !com_spec.is_empty()
+        {
+            return com_spec;
+        }
+        "cmd.exe".to_string()
+    }
+    #[cfg(unix)]
+    {
+        "/bin/sh".to_string()
+    }
+}
+
+/// The flag that the platform default shell uses to run a single command
+/// string and exit. `cmd.exe /C "..."` on Windows; `<sh> -c "..."` on Unix.
+fn shell_command_flag() -> &'static str {
+    if cfg!(windows) { "/C" } else { "-c" }
+}
+
 impl PaneController for EmbeddedPaneController {
     fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
         let mut panes = self.panes.lock().unwrap();
@@ -267,12 +298,12 @@ impl PaneController for EmbeddedPaneController {
             })
             .map_err(|e| PaneError::CommandFailed(format!("Failed to open PTY: {e}")))?;
 
-        let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let default_shell = default_shell();
 
         let mut cmd = match command {
             Some(c) if c.contains(' ') => {
                 let mut cmd = CommandBuilder::new(&default_shell);
-                cmd.arg("-c");
+                cmd.arg(shell_command_flag());
                 cmd.arg(c);
                 cmd
             }

@@ -54,11 +54,22 @@ pub fn socket_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("dot-agent-deck.sock");
+    #[cfg(unix)]
+    {
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            return PathBuf::from(runtime_dir).join("dot-agent-deck.sock");
+        }
+
+        PathBuf::from("/tmp/dot-agent-deck.sock")
     }
 
-    PathBuf::from("/tmp/dot-agent-deck.sock")
+    #[cfg(windows)]
+    {
+        // Windows named pipes live in the `\\.\pipe\` namespace. Include the
+        // current username so multiple users on the same machine don't collide.
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
+        PathBuf::from(format!(r"\\.\pipe\dot-agent-deck-{user}"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

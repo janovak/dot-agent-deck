@@ -1,3 +1,10 @@
+// Integration tests for the daemon IPC layer. These tests use the underlying
+// Unix domain socket types directly (both sync `std::os::unix` and async
+// `tokio::net::UnixStream`) and are therefore Unix-only. Native Windows
+// coverage will be added separately once an async client is exposed through
+// `dot_agent_deck::ipc`.
+#![cfg(unix)]
+
 use std::io::Write as _;
 use std::sync::Arc;
 

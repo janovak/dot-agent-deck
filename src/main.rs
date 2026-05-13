@@ -341,11 +341,23 @@ fn main() -> ExitCode {
 #[tokio::main]
 async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
     // Optional file-based logging when DOT_AGENT_DECK_LOG is set.
-    // Logs go to the file path specified (e.g., DOT_AGENT_DECK_LOG=/tmp/dad.log).
-    // If the value is "1" or empty, defaults to /tmp/dot-agent-deck.log.
+    // Logs go to the file path specified (e.g., DOT_AGENT_DECK_LOG=/tmp/dad.log
+    // on Unix, or DOT_AGENT_DECK_LOG=C:\path\to\log.txt on Windows).
+    // If the value is "1" or empty, defaults to /tmp/dot-agent-deck.log on
+    // Unix and `%TEMP%\dot-agent-deck.log` on Windows.
     if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
         let log_path = if log_val.is_empty() || log_val == "1" {
-            "/tmp/dot-agent-deck.log".to_string()
+            #[cfg(unix)]
+            {
+                "/tmp/dot-agent-deck.log".to_string()
+            }
+            #[cfg(windows)]
+            {
+                std::env::temp_dir()
+                    .join("dot-agent-deck.log")
+                    .to_string_lossy()
+                    .into_owned()
+            }
         } else {
             log_val
         };

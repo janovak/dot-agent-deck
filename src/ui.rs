@@ -1252,15 +1252,20 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offse
 }
 
 /// Copy text to the system clipboard using the OSC 52 escape sequence.
-/// Writes directly to `/dev/tty` to bypass ratatui's buffered terminal output.
+/// Writes directly to the controlling terminal (`/dev/tty` on Unix,
+/// `CONOUT$` on Windows) to bypass ratatui's buffered terminal output.
 fn copy_to_clipboard_osc52(text: &str) {
     use std::io::Write;
     let encoded = base64_encode(text.as_bytes());
     // Use ST (\x1b\\) terminator — more widely supported than BEL (\x07) in raw mode.
     let seq = format!("\x1b]52;c;{encoded}\x1b\\");
-    // Write to /dev/tty directly so the escape sequence reaches the outer terminal
-    // even when ratatui has captured stdout.
-    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+    // Write to the controlling terminal directly so the escape sequence reaches
+    // the outer terminal even when ratatui has captured stdout.
+    #[cfg(unix)]
+    let tty_path = "/dev/tty";
+    #[cfg(windows)]
+    let tty_path = "CONOUT$";
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open(tty_path) {
         let _ = tty.write_all(seq.as_bytes());
         let _ = tty.flush();
     }

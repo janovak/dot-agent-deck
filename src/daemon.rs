@@ -1,25 +1,20 @@
 use std::path::Path;
 
 use tokio::io::AsyncBufReadExt;
-use tokio::net::UnixListener;
 use tracing::{error, info, warn};
 
 use crate::error::DaemonError;
 use crate::event::{AgentEvent, DaemonMessage};
+use crate::ipc;
 use crate::state::SharedState;
 
 pub async fn run_daemon(socket_path: &Path, state: SharedState) -> Result<(), DaemonError> {
-    // Clean up stale socket file
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-
-    let listener = UnixListener::bind(socket_path)?;
+    let mut listener = ipc::Listener::bind(socket_path)?;
     info!("Daemon listening on {}", socket_path.display());
 
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok(stream) => {
                 let state = state.clone();
                 tokio::spawn(async move {
                     let reader = tokio::io::BufReader::new(stream);
