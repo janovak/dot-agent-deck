@@ -1279,6 +1279,44 @@ fn should_force_bracketed_paste(agent_type: &AgentType) -> bool {
     }
 }
 
+/// Fallback agent detection from the pane's launch command, used when
+/// `SessionState::agent_type` is still `None` because no hook events have
+/// arrived yet (e.g., right after spawning a Copilot CLI pane). Returns
+/// `true` if the command's basename is a known agent CLI that should always
+/// receive bracketed-paste-wrapped pastes.
+///
+/// Matching is case-insensitive on the basename of the first whitespace
+/// token of the command, stripping common Windows extensions (`.exe`,
+/// `.cmd`, `.bat`, `.ps1`). Examples that match:
+///   * `copilot`
+///   * `copilot.exe`
+///   * `C:\Program Files\copilot.cmd --resume foo`
+///   * `claude --continue`
+///   * `opencode`
+fn command_indicates_bracketed_paste_agent(command: &str) -> bool {
+    let trimmed = command.trim_start();
+    // Handle leading quote (e.g., `"C:\Program Files\copilot.cmd" --resume foo`).
+    let first_token = if let Some(rest) = trimmed.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("")
+    } else if let Some(rest) = trimmed.strip_prefix('\'') {
+        rest.split('\'').next().unwrap_or("")
+    } else {
+        trimmed.split_whitespace().next().unwrap_or("")
+    };
+    let basename = std::path::Path::new(first_token)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first_token)
+        .to_ascii_lowercase();
+    let stem = basename
+        .strip_suffix(".exe")
+        .or_else(|| basename.strip_suffix(".cmd"))
+        .or_else(|| basename.strip_suffix(".bat"))
+        .or_else(|| basename.strip_suffix(".ps1"))
+        .unwrap_or(basename.as_str());
+    matches!(stem, "copilot" | "claude" | "opencode")
+}
+
 /// Strip trailing `\r`/`\n` from a pasted payload so the paste never
 /// auto-submits. The user is expected to press Enter explicitly after
 /// the paste. Internal newlines are preserved so multi-line content
@@ -2845,7 +2883,17 @@ pub fn run_tui(
                         .find(|s| s.pane_id.as_deref() == Some(pane_id.as_str()))
                         .map(|s| should_force_bracketed_paste(&s.agent_type))
                         .unwrap_or(false);
-                    let use_bracketed = advertised_bracketed || agent_force_bracketed;
+                    // Fallback for the early window between pane spawn and
+                    // the first hook event arriving (when session.agent_type
+                    // is still None) — derive the agent identity from the
+                    // pane's launch command.
+                    let command_force_bracketed = ui
+                        .pane_metadata
+                        .get(pane_id.as_str())
+                        .map(|m| command_indicates_bracketed_paste_agent(&m.command))
+                        .unwrap_or(false);
+                    let use_bracketed =
+                        advertised_bracketed || agent_force_bracketed || command_force_bracketed;
 
                     // Strip trailing CR/LF so a paste never auto-submits — the
                     // user must press Enter explicitly afterwards. This applies
@@ -2864,6 +2912,18 @@ pub fn run_tui(
                         payload.extend_from_slice(b"\x1b[201~");
                     }
                     let _ = embedded.write_raw_bytes(&pane_id, &payload);
+
+                    // Visible diagnostic so the user can tell which paste path
+                    // ran. Especially useful when troubleshooting a multi-line
+                    // paste that splits: if this says "bracketed" but the
+                    // paste still arrives as multiple submits, the agent does
+                    // not honor bracketed-paste markers and a different fix
+                    // is required.
+                    let mode = if use_bracketed { "bracketed" } else { "raw" };
+                    ui.status_message = Some((
+                        format!("Pasted {} chars ({})", body.chars().count(), mode),
+                        std::time::Instant::now(),
+                    ));
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
@@ -8737,6 +8797,60 @@ mod tests {
         // Plain shell panes (cmd, powershell, bash with no PS1 wrapper) — wrapping
         // here would corrupt input by inserting literal `␛[200~` text.
         assert!(!should_force_bracketed_paste(&AgentType::None));
+    }
+
+    // -----------------------------------------------------------------------
+    // Command-string fallback for bracketed-paste agent detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn command_detects_copilot_cli() {
+        assert!(command_indicates_bracketed_paste_agent("copilot"));
+        assert!(command_indicates_bracketed_paste_agent("copilot.exe"));
+        assert!(command_indicates_bracketed_paste_agent("copilot.cmd"));
+        assert!(command_indicates_bracketed_paste_agent("Copilot.EXE"));
+        assert!(command_indicates_bracketed_paste_agent(
+            "copilot --resume foo"
+        ));
+    }
+
+    #[test]
+    fn command_detects_copilot_with_full_path() {
+        // Quoted (the realistic form for paths with spaces on Windows).
+        assert!(command_indicates_bracketed_paste_agent(
+            r#""C:\Program Files\copilot.cmd""#
+        ));
+        assert!(command_indicates_bracketed_paste_agent(
+            r#""C:\Program Files\copilot.cmd" --resume foo"#
+        ));
+        // Unquoted, no spaces.
+        assert!(command_indicates_bracketed_paste_agent(
+            r"C:\tools\copilot.cmd"
+        ));
+        assert!(command_indicates_bracketed_paste_agent(
+            "/usr/local/bin/copilot"
+        ));
+    }
+
+    #[test]
+    fn command_detects_claude_and_opencode() {
+        assert!(command_indicates_bracketed_paste_agent("claude"));
+        assert!(command_indicates_bracketed_paste_agent("claude --continue"));
+        assert!(command_indicates_bracketed_paste_agent("opencode"));
+    }
+
+    #[test]
+    fn command_does_not_match_shells_or_unknown_commands() {
+        assert!(!command_indicates_bracketed_paste_agent("bash"));
+        assert!(!command_indicates_bracketed_paste_agent("cmd"));
+        assert!(!command_indicates_bracketed_paste_agent("cmd.exe"));
+        assert!(!command_indicates_bracketed_paste_agent("powershell"));
+        assert!(!command_indicates_bracketed_paste_agent("pwsh.exe"));
+        assert!(!command_indicates_bracketed_paste_agent(
+            "python -m something"
+        ));
+        assert!(!command_indicates_bracketed_paste_agent(""));
+        assert!(!command_indicates_bracketed_paste_agent("copilot-other"));
     }
 
     // -----------------------------------------------------------------------
