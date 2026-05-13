@@ -1260,6 +1260,25 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offse
     trimmed.to_string()
 }
 
+/// Whether dot-agent-deck should always wrap pastes for this agent in
+/// bracketed-paste markers, even if the agent never sent `\x1b[?2004h` to
+/// enable bracketed-paste mode itself.
+///
+/// Some agent CLIs (notably Copilot CLI) accept bracketed-paste sequences
+/// correctly but never advertise them, so without this override every `\n`
+/// in a multi-line paste is interpreted as Enter and the lines get submitted
+/// one at a time.
+fn should_force_bracketed_paste(agent_type: &AgentType) -> bool {
+    match agent_type {
+        // Copilot CLI accepts bracketed paste but does not advertise it.
+        AgentType::CopilotCli => true,
+        // ClaudeCode and OpenCode advertise bracketed paste themselves;
+        // None means no agent has been detected yet (e.g., a plain shell
+        // pane), where wrapping would put literal `␛[200~` in the input.
+        AgentType::ClaudeCode | AgentType::OpenCode | AgentType::None => false,
+    }
+}
+
 /// Copy text to the system clipboard using the OSC 52 escape sequence.
 /// Writes directly to the controlling terminal (`/dev/tty` on Unix,
 /// `CONOUT$` on Windows) to bypass ratatui's buffered terminal output.
@@ -2793,17 +2812,30 @@ pub fn run_tui(
                 continue;
             }
 
-            // Handle paste: wrap in bracketed paste sequences if the child app enabled it.
+            // Handle paste: wrap in bracketed paste sequences if the child app
+            // has enabled bracketed-paste mode (DECSET 2004), OR if the pane is
+            // running an agent we know supports it but doesn't advertise. The
+            // override list exists because some agents (notably Copilot CLI)
+            // accept bracketed paste correctly but never send the enable
+            // sequence — without the override, multi-line pastes get submitted
+            // line-by-line because every \n is treated as Enter.
             if let Event::Paste(text) = ev {
                 if ui.mode == UiMode::PaneInput
                     && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                     && let Some(pane_id) = embedded.focused_pane_id()
                 {
                     embedded.reset_scrollback(&pane_id);
-                    let use_bracketed = embedded
+                    let advertised_bracketed = embedded
                         .get_screen(&pane_id)
                         .and_then(|s| s.lock().ok().map(|p| p.screen().bracketed_paste()))
                         .unwrap_or(false);
+                    let agent_force_bracketed = snapshot
+                        .sessions
+                        .values()
+                        .find(|s| s.pane_id.as_deref() == Some(pane_id.as_str()))
+                        .map(|s| should_force_bracketed_paste(&s.agent_type))
+                        .unwrap_or(false);
+                    let use_bracketed = advertised_bracketed || agent_force_bracketed;
                     let mut payload = Vec::new();
                     if use_bracketed {
                         payload.extend_from_slice(b"\x1b[200~");
@@ -8664,5 +8696,27 @@ mod tests {
     #[test]
     fn hit_test_card_empty_returns_none() {
         assert_eq!(hit_test_card(&[], 10, 10), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-agent bracketed-paste override
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn force_bracketed_paste_for_copilot_cli() {
+        assert!(should_force_bracketed_paste(&AgentType::CopilotCli));
+    }
+
+    #[test]
+    fn no_force_for_agents_that_advertise_bracketed_paste() {
+        assert!(!should_force_bracketed_paste(&AgentType::ClaudeCode));
+        assert!(!should_force_bracketed_paste(&AgentType::OpenCode));
+    }
+
+    #[test]
+    fn no_force_when_no_agent_detected() {
+        // Plain shell panes (cmd, powershell, bash with no PS1 wrapper) — wrapping
+        // here would corrupt input by inserting literal `␛[200~` text.
+        assert!(!should_force_bracketed_paste(&AgentType::None));
     }
 }
