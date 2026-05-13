@@ -42,6 +42,19 @@ These shortcuts work in Normal mode when a mode tab is active.
 
 In PaneInput mode, use `Ctrl+d` to return to Normal mode.
 
+## Mouse Copy / Paste (inside any focused pane)
+
+| Action | What it does |
+|---|---|
+| Click-and-drag | Highlight text in the focused pane. The highlight stays visible after you release the mouse — nothing is copied yet. |
+| Double-click | Select the word under the cursor (highlight persists). |
+| Triple-click | Select the paragraph under the cursor (highlight persists). |
+| Right-click with a visible highlight | **Copy** the highlight to the system clipboard (via OSC 52), then clear the highlight. Flashes "Copied to clipboard" in the status bar. |
+| Right-click with no highlight | **Paste** the system clipboard contents into the focused pane (via the same path as `Ctrl+V`, including bracketed-paste wrap for known agents and trailing-newline strip so the paste doesn't auto-submit). |
+| `Ctrl+V` (Windows Terminal) / `Cmd+V` (macOS Terminal) | Paste from the system clipboard — the outer terminal emulator delivers the clipboard bytes; dot-agent-deck forwards them to the focused pane. Works identically to right-click-paste. |
+| `Ctrl+d` | Returns to Normal mode and clears any visible highlight. |
+| `Ctrl+click` (on a URL in the pane) | Open the URL in your default browser. |
+
 ## Dashboard
 
 These shortcuts work in **command mode**. If you're typing in an agent pane, press `Ctrl+d` first to leave the pane — otherwise the keystroke is sent to the agent.

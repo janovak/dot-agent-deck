@@ -2914,32 +2914,72 @@ pub fn run_tui(
                         crossterm::event::MouseEventKind::Up(
                             crossterm::event::MouseButton::Left,
                         ) => {
+                            // Copy is no longer performed here — the user
+                            // explicitly invokes it via right-click while a
+                            // selection is visible (Windows-explorer model).
+                            // The highlight stays painted by the existing
+                            // render code as long as `ui.selection` is set.
+                            //
+                            // Collapse a plain single-click (zero-area
+                            // selection that never moved) so we don't leave
+                            // a phantom 1-cell highlight after every click.
                             let was_multiclick = ui
                                 .last_click
                                 .map(|(_, _, _, cnt)| cnt >= 2)
                                 .unwrap_or(false);
-                            // Only copy when the selection is a real drag or multi-click,
-                            // not a plain single click.
                             if let Some(ref sel) = ui.selection
-                                && (was_multiclick
-                                    || sel.start_col != sel.end_col
-                                    || sel.start_row != sel.end_row)
-                                && let Some(screen_arc) = embedded.get_screen(&pane_id)
-                                && let Ok(parser) = screen_arc.lock()
+                                && !was_multiclick
+                                && sel.start_col == sel.end_col
+                                && sel.start_row == sel.end_row
                             {
-                                let offset = screen_row_offset(parser.screen(), sel.pane_rect);
-                                let text = extract_selection_text(parser.screen(), sel, offset);
-                                if !text.is_empty() {
-                                    copy_to_clipboard_osc52(&text);
-                                    ui.status_message = Some((
-                                        "Copied to clipboard".to_string(),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                            }
-                            // Keep selection visible after multi-click; clear on single-click.
-                            if !was_multiclick {
                                 ui.selection = None;
+                            }
+                        }
+                        crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Right,
+                        ) => {
+                            // Right-click model (Windows-explorer style):
+                            //   * If a selection is visible → copy it and
+                            //     clear the highlight (the copy "consumes"
+                            //     the selection).
+                            //   * Otherwise → paste from the system
+                            //     clipboard into the focused pane via the
+                            //     same burst buffer that handles Ctrl+V
+                            //     pastes (trailing CR/LF stripped,
+                            //     bracketed-paste wrap when on a known
+                            //     agent).
+                            if let Some(ref sel) = ui.selection {
+                                if let Some(screen_arc) = embedded.get_screen(&pane_id)
+                                    && let Ok(parser) = screen_arc.lock()
+                                {
+                                    let offset = screen_row_offset(parser.screen(), sel.pane_rect);
+                                    let text = extract_selection_text(parser.screen(), sel, offset);
+                                    if !text.is_empty() {
+                                        copy_to_clipboard_osc52(&text);
+                                        ui.status_message = Some((
+                                            "Copied to clipboard".to_string(),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                                ui.selection = None;
+                            } else if ui.mode == UiMode::PaneInput {
+                                match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+                                    Ok(text) if !text.is_empty() => {
+                                        pane_input_burst.extend_from_slice(text.as_bytes());
+                                        pane_input_burst_keys =
+                                            pane_input_burst_keys.saturating_add(2);
+                                    }
+                                    Ok(_) => {
+                                        // Empty clipboard — no-op.
+                                    }
+                                    Err(e) => {
+                                        ui.status_message = Some((
+                                            format!("Clipboard read failed: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -3030,6 +3070,10 @@ pub fn run_tui(
                         }
                         ui.mode = UiMode::Normal;
                         ui.status_message = None;
+                        // Drop any persisted text selection so the highlight
+                        // is dismissed when the user returns to command mode
+                        // (matches the Esc-to-dismiss convention).
+                        ui.selection = None;
                         shortcut_handled = true;
                     }
                     // Ctrl+t: toggle layout
