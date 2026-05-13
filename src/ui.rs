@@ -1323,13 +1323,6 @@ fn command_indicates_bracketed_paste_agent(command: &str) -> bool {
 /// remains intact (bracketed-paste mode keeps them as content; in raw
 /// mode each internal newline still triggers a submit, but the *last*
 /// line at least waits for the user).
-fn strip_paste_trailing_newlines(text: &str) -> &str {
-    text.trim_end_matches(['\r', '\n'])
-}
-
-/// Same as `strip_paste_trailing_newlines` but operates on bytes —
-/// used by the keystroke-burst flush path where the buffered payload
-/// is `Vec<u8>` rather than `&str`.
 fn strip_paste_trailing_newlines_bytes(bytes: &[u8]) -> &[u8] {
     let mut end = bytes.len();
     while end > 0 && (bytes[end - 1] == b'\r' || bytes[end - 1] == b'\n') {
@@ -1356,7 +1349,6 @@ fn strip_paste_trailing_newlines_bytes(bytes: &[u8]) -> &[u8] {
 ///     known agent CLI), the payload is wrapped in `␛[200~ … ␛[201~`
 ///     bracketed-paste markers so internal newlines are treated as
 ///     content rather than per-line submits.
-///   * A status-bar diagnostic shows the size and mode (bracketed/raw).
 ///
 /// On exit the burst buffer is always emptied.
 fn flush_pane_input_burst(
@@ -1401,15 +1393,6 @@ fn flush_pane_input_burst(
         if use_bracketed {
             payload.extend_from_slice(b"\x1b[201~");
         }
-        ui.status_message = Some((
-            format!(
-                "Pasted {} chars ({}) [{} keys]",
-                stripped.len(),
-                if use_bracketed { "bracketed" } else { "raw" },
-                burst_keys,
-            ),
-            std::time::Instant::now(),
-        ));
         payload
     } else {
         // Single keystroke — same behaviour as before burst-detection.
@@ -2968,70 +2951,21 @@ pub fn run_tui(
                 continue;
             }
 
-            // Handle paste: wrap in bracketed paste sequences if the child app
-            // has enabled bracketed-paste mode (DECSET 2004), OR if the pane is
-            // running an agent we know supports it but doesn't advertise. The
-            // override list exists because some agents (notably Copilot CLI)
-            // accept bracketed paste correctly but never send the enable
-            // sequence — without the override, multi-line pastes get submitted
-            // line-by-line because every \n is treated as Enter.
+            // Handle paste: route through the same per-frame burst buffer
+            // that catches keystroke-flooded pastes on terminals that don't
+            // emit `Event::Paste` (e.g., Windows Terminal in some configs).
+            // Both paths end up at `flush_pane_input_burst` below, which is
+            // the single source of truth for paste payload assembly: trailing
+            // CR/LF strip, bracketed-paste wrap decision, status-message
+            // diagnostic, and PTY write.
             if let Event::Paste(text) = ev {
-                if ui.mode == UiMode::PaneInput
-                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                    && let Some(pane_id) = embedded.focused_pane_id()
-                {
-                    embedded.reset_scrollback(&pane_id);
-                    let advertised_bracketed = embedded
-                        .get_screen(&pane_id)
-                        .and_then(|s| s.lock().ok().map(|p| p.screen().bracketed_paste()))
-                        .unwrap_or(false);
-                    let agent_force_bracketed = snapshot
-                        .sessions
-                        .values()
-                        .find(|s| s.pane_id.as_deref() == Some(pane_id.as_str()))
-                        .map(|s| should_force_bracketed_paste(&s.agent_type))
-                        .unwrap_or(false);
-                    // Fallback for the early window between pane spawn and
-                    // the first hook event arriving (when session.agent_type
-                    // is still None) — derive the agent identity from the
-                    // pane's launch command.
-                    let command_force_bracketed = ui
-                        .pane_metadata
-                        .get(pane_id.as_str())
-                        .map(|m| command_indicates_bracketed_paste_agent(&m.command))
-                        .unwrap_or(false);
-                    let use_bracketed =
-                        advertised_bracketed || agent_force_bracketed || command_force_bracketed;
-
-                    // Strip trailing CR/LF so a paste never auto-submits — the
-                    // user must press Enter explicitly afterwards. This applies
-                    // regardless of bracketed-paste support: many agent CLIs
-                    // (Copilot CLI, claude, opencode) treat the trailing newline
-                    // of a clipboard paste as "submit", which is almost never
-                    // what the user wants.
-                    let body = strip_paste_trailing_newlines(&text);
-
-                    let mut payload = Vec::new();
-                    if use_bracketed {
-                        payload.extend_from_slice(b"\x1b[200~");
-                    }
-                    payload.extend_from_slice(body.as_bytes());
-                    if use_bracketed {
-                        payload.extend_from_slice(b"\x1b[201~");
-                    }
-                    let _ = embedded.write_raw_bytes(&pane_id, &payload);
-
-                    // Visible diagnostic so the user can tell which paste path
-                    // ran. Especially useful when troubleshooting a multi-line
-                    // paste that splits: if this says "bracketed" but the
-                    // paste still arrives as multiple submits, the agent does
-                    // not honor bracketed-paste markers and a different fix
-                    // is required.
-                    let mode = if use_bracketed { "bracketed" } else { "raw" };
-                    ui.status_message = Some((
-                        format!("Pasted {} chars ({})", body.chars().count(), mode),
-                        std::time::Instant::now(),
-                    ));
+                if ui.mode == UiMode::PaneInput {
+                    pane_input_burst.extend_from_slice(text.as_bytes());
+                    // Use `2` as the burst-key count even for a single-byte
+                    // paste so the flush always takes the paste branch
+                    // (strip trailing newlines + wrap) rather than the
+                    // single-keystroke pass-through branch.
+                    pane_input_burst_keys = pane_input_burst_keys.saturating_add(2);
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
@@ -9008,64 +8942,58 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Paste trailing-newline strip
+    // Paste trailing-newline strip (byte-flavoured; the one path used by
+    // both the keystroke-burst flush and the `Event::Paste` route).
     // -----------------------------------------------------------------------
 
     #[test]
-    fn strip_paste_removes_single_trailing_lf() {
-        assert_eq!(strip_paste_trailing_newlines("hello\n"), "hello");
+    fn strip_paste_bytes_removes_single_trailing_lf() {
+        assert_eq!(strip_paste_trailing_newlines_bytes(b"hello\n"), b"hello");
     }
 
     #[test]
-    fn strip_paste_removes_crlf() {
-        assert_eq!(strip_paste_trailing_newlines("hello\r\n"), "hello");
+    fn strip_paste_bytes_removes_crlf() {
+        assert_eq!(strip_paste_trailing_newlines_bytes(b"hello\r\n"), b"hello");
     }
 
     #[test]
-    fn strip_paste_removes_multiple_trailing_newlines() {
+    fn strip_paste_bytes_removes_multiple_trailing_newlines() {
         // Copying from a text editor sometimes appends multiple blank lines.
-        assert_eq!(strip_paste_trailing_newlines("hello\n\n\n"), "hello");
-        assert_eq!(strip_paste_trailing_newlines("hello\r\n\r\n"), "hello");
+        assert_eq!(
+            strip_paste_trailing_newlines_bytes(b"hello\n\n\n"),
+            b"hello"
+        );
+        assert_eq!(
+            strip_paste_trailing_newlines_bytes(b"hello\r\n\r\n"),
+            b"hello"
+        );
     }
 
     #[test]
-    fn strip_paste_preserves_internal_newlines() {
+    fn strip_paste_bytes_preserves_internal_newlines() {
         // Multi-line snippets must keep their interior structure; only the
         // final newline (which would trigger auto-submit) is removed.
         assert_eq!(
-            strip_paste_trailing_newlines("line1\nline2\nline3\n"),
-            "line1\nline2\nline3"
+            strip_paste_trailing_newlines_bytes(b"line1\nline2\nline3\n"),
+            b"line1\nline2\nline3"
         );
     }
 
     #[test]
-    fn strip_paste_no_trailing_newline_is_unchanged() {
-        assert_eq!(strip_paste_trailing_newlines("hello"), "hello");
-        assert_eq!(strip_paste_trailing_newlines("a\nb"), "a\nb");
-    }
-
-    #[test]
-    fn strip_paste_only_newlines_becomes_empty() {
-        assert_eq!(strip_paste_trailing_newlines("\n\n\n"), "");
-        assert_eq!(strip_paste_trailing_newlines("\r\n"), "");
-        assert_eq!(strip_paste_trailing_newlines(""), "");
-    }
-
-    // -----------------------------------------------------------------------
-    // Byte-flavoured variant used by the keystroke-burst flush path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn strip_paste_bytes_matches_str_variant() {
-        assert_eq!(strip_paste_trailing_newlines_bytes(b"hello\n"), b"hello");
-        assert_eq!(strip_paste_trailing_newlines_bytes(b"hello\r\n"), b"hello");
-        assert_eq!(
-            strip_paste_trailing_newlines_bytes(b"line1\nline2\n"),
-            b"line1\nline2"
-        );
+    fn strip_paste_bytes_no_trailing_newline_is_unchanged() {
         assert_eq!(strip_paste_trailing_newlines_bytes(b"hello"), b"hello");
-        assert_eq!(strip_paste_trailing_newlines_bytes(b""), b"");
+        assert_eq!(strip_paste_trailing_newlines_bytes(b"a\nb"), b"a\nb");
+    }
+
+    #[test]
+    fn strip_paste_bytes_only_newlines_becomes_empty() {
         assert_eq!(strip_paste_trailing_newlines_bytes(b"\n\n\n"), b"");
+        assert_eq!(strip_paste_trailing_newlines_bytes(b"\r\n"), b"");
+        assert_eq!(strip_paste_trailing_newlines_bytes(b""), b"");
+    }
+
+    #[test]
+    fn strip_paste_bytes_preserves_non_utf8() {
         // Bytes-only edge case: non-UTF8 trailing data is preserved through
         // the strip (we only ever drop ASCII CR/LF).
         assert_eq!(
