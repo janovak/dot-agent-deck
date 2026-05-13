@@ -1,0 +1,2 @@
+- **Click-to-Switch on the Dashboard and Tab Bar**
+  Clicking a tab in the tab bar now switches to that tab (matches `Ctrl+PageDown`/`Ctrl+PageUp`). Clicking a session card on the dashboard now focuses that session's pane and enters PaneInput mode (matches the `1`–`9` keyboard shortcut). Previously, the only way to switch sessions or tabs was via keyboard — mouse navigation was limited to focusing panes inside a mode tab.

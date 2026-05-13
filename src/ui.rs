@@ -493,6 +493,12 @@ struct UiState {
     side_pane_rects: Vec<(String, Rect)>,
     /// Screen rect of the agent pane in mode tabs (set during render, used for click-to-focus).
     agent_pane_rect: Option<Rect>,
+    /// Screen rects of session cards on the dashboard (flat_index, rect).
+    /// Set during render, used for click-to-focus a card.
+    card_rects: Vec<(usize, Rect)>,
+    /// Screen rects of tab-bar labels (indexed by tab index).
+    /// Set during render, used for click-to-switch tabs.
+    tab_label_rects: Vec<Rect>,
     /// Tracks last click time and position for double/triple-click detection.
     last_click: Option<(std::time::Instant, u16, u16, u8)>, // (time, col, row, click_count)
     /// Star-prompt state for the "star the repo" reminder dialog.
@@ -556,6 +562,8 @@ impl UiState {
             focused_pane_rect: None,
             side_pane_rects: Vec::new(),
             agent_pane_rect: None,
+            card_rects: Vec::new(),
+            tab_label_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
             idle_art_cache: HashMap::new(),
@@ -2402,9 +2410,33 @@ pub fn run_tui(
 
             // Handle mouse events: scroll, text selection, and copy.
             if let Event::Mouse(mouse) = ev {
+                // ── Tab-bar click: switch to the clicked tab ──────────────
+                // Mirrors Ctrl+PageUp/PageDown keyboard behaviour; works in
+                // any mode (matches keyboard which is gated only on Ctrl).
+                let mut click_handled = false;
+                if matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                ) && tab_manager.show_tab_bar()
+                {
+                    let hit_tab: Option<usize> =
+                        hit_test_tab(&ui.tab_label_rects, mouse.column, mouse.row);
+                    if let Some(idx) = hit_tab {
+                        if idx != tab_manager.active_index() {
+                            tab_manager.switch_to(idx);
+                            let area = terminal.get_frame().area();
+                            resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                            resize_mode_tab_panes(&*pane, &tab_manager, area);
+                        }
+                        click_handled = true;
+                    }
+                }
+
                 // Side pane scroll: works in any UI mode by hit-testing rects
                 let mut side_scrolled = false;
-                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                if !click_handled
+                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                {
                     let side_rects = ui.side_pane_rects.clone();
                     let scroll_delta = match mouse.kind {
                         crossterm::event::MouseEventKind::ScrollUp => Some(3_isize),
@@ -2427,7 +2459,8 @@ pub fn run_tui(
                 }
 
                 // Click-to-focus for mode tab panes (Normal mode only).
-                if ui.mode == UiMode::Normal
+                if !click_handled
+                    && ui.mode == UiMode::Normal
                     && matches!(
                         mouse.kind,
                         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
@@ -2469,10 +2502,46 @@ pub fn run_tui(
                     {
                         *focused_side_pane_index = None;
                         let _ = pane.focus_pane(agent_pane_id);
+                        clicked_focus = true;
+                    }
+                    if clicked_focus {
+                        click_handled = true;
                     }
                 }
 
-                if !side_scrolled
+                // Dashboard card click: focus that session's pane.
+                //
+                // Allowed in Normal *and* PaneInput modes — unlike the `1`–`9`
+                // keyboard shortcut, a click on a card lives outside any
+                // terminal area so it's unambiguously a navigation gesture
+                // (no need to press `Ctrl+d` first). Modal dialog modes
+                // (Filter, Rename, Help, etc.) still suppress card clicks.
+                if !click_handled
+                    && matches!(ui.mode, UiMode::Normal | UiMode::PaneInput)
+                    && matches!(
+                        mouse.kind,
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                    )
+                    && matches!(tab_manager.active_tab(), Tab::Dashboard)
+                {
+                    let hit_card: Option<usize> =
+                        hit_test_card(&ui.card_rects, mouse.column, mouse.row);
+                    if let Some(idx) = hit_card {
+                        // Dismiss idle art on the target card (matches `1`–`9` behaviour).
+                        if let Some((sid, _)) = filtered.get(idx)
+                            && let Some(entry) = ui.idle_art_cache.get_mut(*sid)
+                        {
+                            entry.dismissed = true;
+                        }
+                        focus_deck(idx, &mut ui, &filtered, &snapshot, &state, &*pane);
+                        let area = terminal.get_frame().area();
+                        resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                        click_handled = true;
+                    }
+                }
+
+                if !click_handled
+                    && !side_scrolled
                     && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                     && let Some(pane_id) = embedded.focused_pane_id()
                 {
@@ -3537,6 +3606,64 @@ pub fn run_tui(
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// Compute per-label screen rects for the tab bar.
+///
+/// Mirrors how ratatui's `Tabs` widget lays out labels: each title is rendered
+/// at its display width, separated by a 1-cell `│` divider between consecutive
+/// tabs. The result is used for click-to-switch hit-testing.
+fn compute_tab_label_rects(titles: &[Line], bar_area: Rect) -> Vec<Rect> {
+    let mut rects = Vec::with_capacity(titles.len());
+    let mut tab_x = bar_area.x;
+    let bar_end = bar_area.x.saturating_add(bar_area.width);
+    for (idx, title) in titles.iter().enumerate() {
+        if tab_x >= bar_end {
+            break;
+        }
+        let width = title.width() as u16;
+        let avail = bar_end.saturating_sub(tab_x);
+        let bounded = width.min(avail);
+        rects.push(Rect {
+            x: tab_x,
+            y: bar_area.y,
+            width: bounded,
+            height: 1,
+        });
+        tab_x = tab_x.saturating_add(width);
+        if idx + 1 < titles.len() {
+            // "│" divider width = 1 cell
+            tab_x = tab_x.saturating_add(1);
+        }
+    }
+    rects
+}
+
+/// Hit-test a tab-bar click. Tabs are single-row, so only `row == rect.y` hits.
+fn hit_test_tab(rects: &[Rect], col: u16, row: u16) -> Option<usize> {
+    rects.iter().enumerate().find_map(|(idx, rect)| {
+        if row == rect.y && col >= rect.x && col < rect.x.saturating_add(rect.width) {
+            Some(idx)
+        } else {
+            None
+        }
+    })
+}
+
+/// Hit-test a dashboard-card click. Returns the flat card index, not the
+/// slot position — so callers can pass it directly to `focus_deck`.
+fn hit_test_card(rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usize> {
+    rects.iter().find_map(|(card_idx, rect)| {
+        if col >= rect.x
+            && col < rect.x.saturating_add(rect.width)
+            && row >= rect.y
+            && row < rect.y.saturating_add(rect.height)
+        {
+            Some(*card_idx)
+        } else {
+            None
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
@@ -3554,6 +3681,8 @@ fn render_frame(
     let palette = ui.palette;
     ui.side_pane_rects.clear();
     ui.agent_pane_rect = None;
+    ui.card_rects.clear();
+    ui.tab_label_rects.clear();
 
     let active_mode_name = match tab_view {
         ActiveTabView::Dashboard { .. } | ActiveTabView::Orchestration { .. } => None,
@@ -3582,6 +3711,12 @@ fn render_frame(
             .iter()
             .map(|l| Line::from(format!(" {l} ")))
             .collect();
+
+        // Track per-tab rects for click-to-switch. Mirrors how ratatui's
+        // `Tabs` widget lays out labels: each title's display width, with a
+        // 1-cell divider between consecutive tabs.
+        ui.tab_label_rects = compute_tab_label_rects(&titles, chunks[0]);
+
         // Fill tab bar row with distinct background.
         frame.render_widget(
             Block::default().style(Style::default().bg(palette.tab_bar_bg)),
@@ -3838,6 +3973,8 @@ fn render_frame(
                 if n <= 9 { Some(n as u8) } else { None }
             };
             let idle_art = ids.get(col_idx).and_then(|id| ui.idle_art_cache.get(*id));
+            // Track card rect for click-to-focus.
+            ui.card_rects.push((flat_index, col_chunks[col_idx]));
             render_session_card(
                 frame,
                 col_chunks[col_idx],
@@ -8275,5 +8412,257 @@ mod tests {
         );
         assert_eq!(ui.pending_dispatches[0].pane_id, *orchestrator_pane);
         assert!(ui.pending_dispatches[0].prompt.contains("coder"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Click-to-switch: tab-bar and dashboard card hit-testing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_tab_label_rects_single_label() {
+        let titles = vec![Line::from(" Dashboard ")];
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 1,
+        };
+        let rects = compute_tab_label_rects(&titles, bar);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].x, 0);
+        assert_eq!(rects[0].y, 0);
+        assert_eq!(rects[0].width, " Dashboard ".len() as u16);
+        assert_eq!(rects[0].height, 1);
+    }
+
+    #[test]
+    fn compute_tab_label_rects_three_labels_have_divider_gap() {
+        let titles = vec![
+            Line::from(" Dashboard "),
+            Line::from(" Mode "),
+            Line::from(" Orchestration "),
+        ];
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 1,
+        };
+        let rects = compute_tab_label_rects(&titles, bar);
+        assert_eq!(rects.len(), 3);
+        // First tab starts at 0.
+        assert_eq!(rects[0].x, 0);
+        // Second tab starts after first tab's width + 1 (divider).
+        let w0 = " Dashboard ".len() as u16;
+        assert_eq!(rects[1].x, w0 + 1);
+        // Third tab starts after second tab's width + 1 (divider).
+        let w1 = " Mode ".len() as u16;
+        assert_eq!(rects[2].x, w0 + 1 + w1 + 1);
+    }
+
+    #[test]
+    fn compute_tab_label_rects_offset_origin() {
+        // Tab bar that doesn't start at column 0 (e.g., embedded in a layout).
+        let titles = vec![Line::from(" A "), Line::from(" B ")];
+        let bar = Rect {
+            x: 5,
+            y: 2,
+            width: 80,
+            height: 1,
+        };
+        let rects = compute_tab_label_rects(&titles, bar);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].x, 5);
+        assert_eq!(rects[0].y, 2);
+        assert_eq!(rects[1].x, 5 + 3 + 1); // " A " (width 3) + divider
+        assert_eq!(rects[1].y, 2);
+    }
+
+    #[test]
+    fn compute_tab_label_rects_clips_to_bar_width() {
+        // Bar too narrow to fit all labels — later labels get clipped or dropped.
+        let titles = vec![
+            Line::from(" Aaa "),
+            Line::from(" Bbb "),
+            Line::from(" Ccc "),
+        ];
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 8, // only fits first label (5) + divider (1) + 2 of next
+            height: 1,
+        };
+        let rects = compute_tab_label_rects(&titles, bar);
+        // First label fits fully; second is partially clipped; third doesn't fit.
+        assert!(!rects.is_empty());
+        // Total width of returned rects must not extend past the bar's right edge.
+        for rect in &rects {
+            assert!(
+                rect.x + rect.width <= bar.x + bar.width,
+                "rect {rect:?} exceeds bar end {}",
+                bar.x + bar.width
+            );
+        }
+    }
+
+    #[test]
+    fn compute_tab_label_rects_empty_input() {
+        let rects = compute_tab_label_rects(
+            &[],
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 1,
+            },
+        );
+        assert!(rects.is_empty());
+    }
+
+    #[test]
+    fn hit_test_tab_finds_clicked_tab() {
+        let rects = vec![
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 1,
+            },
+            Rect {
+                x: 11,
+                y: 0,
+                width: 6,
+                height: 1,
+            },
+            Rect {
+                x: 18,
+                y: 0,
+                width: 12,
+                height: 1,
+            },
+        ];
+        // Inside first tab.
+        assert_eq!(hit_test_tab(&rects, 5, 0), Some(0));
+        // Inside second tab.
+        assert_eq!(hit_test_tab(&rects, 14, 0), Some(1));
+        // Inside third tab.
+        assert_eq!(hit_test_tab(&rects, 25, 0), Some(2));
+        // On the divider gap (col 10) between first and second tab — no hit.
+        assert_eq!(hit_test_tab(&rects, 10, 0), None);
+        // Past the last tab.
+        assert_eq!(hit_test_tab(&rects, 50, 0), None);
+        // Wrong row.
+        assert_eq!(hit_test_tab(&rects, 5, 1), None);
+    }
+
+    #[test]
+    fn hit_test_tab_handles_left_edge() {
+        let rects = vec![Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 1,
+        }];
+        // col == rect.x is INSIDE (>= test).
+        assert_eq!(hit_test_tab(&rects, 0, 0), Some(0));
+        // col == rect.x + rect.width is OUTSIDE (< test).
+        assert_eq!(hit_test_tab(&rects, 5, 0), None);
+    }
+
+    #[test]
+    fn hit_test_tab_empty_returns_none() {
+        assert_eq!(hit_test_tab(&[], 0, 0), None);
+        assert_eq!(hit_test_tab(&[], 100, 100), None);
+    }
+
+    #[test]
+    fn hit_test_card_finds_clicked_card_by_flat_index() {
+        // A 2x2 grid of cards: flat indices 0,1,2,3.
+        let rects = vec![
+            (
+                0,
+                Rect {
+                    x: 0,
+                    y: 5,
+                    width: 40,
+                    height: 8,
+                },
+            ),
+            (
+                1,
+                Rect {
+                    x: 40,
+                    y: 5,
+                    width: 40,
+                    height: 8,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    x: 0,
+                    y: 13,
+                    width: 40,
+                    height: 8,
+                },
+            ),
+            (
+                3,
+                Rect {
+                    x: 40,
+                    y: 13,
+                    width: 40,
+                    height: 8,
+                },
+            ),
+        ];
+        // Top-left card.
+        assert_eq!(hit_test_card(&rects, 5, 7), Some(0));
+        // Top-right.
+        assert_eq!(hit_test_card(&rects, 50, 7), Some(1));
+        // Bottom-left.
+        assert_eq!(hit_test_card(&rects, 5, 15), Some(2));
+        // Bottom-right.
+        assert_eq!(hit_test_card(&rects, 60, 18), Some(3));
+        // Above the cards.
+        assert_eq!(hit_test_card(&rects, 5, 0), None);
+        // Below the cards.
+        assert_eq!(hit_test_card(&rects, 5, 30), None);
+        // Past the right edge.
+        assert_eq!(hit_test_card(&rects, 200, 7), None);
+    }
+
+    #[test]
+    fn hit_test_card_returns_flat_index_not_vec_position() {
+        // Scrolled dashboard: visible cards have non-zero starting flat index.
+        let rects = vec![
+            (
+                5,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 8,
+                },
+            ),
+            (
+                6,
+                Rect {
+                    x: 40,
+                    y: 0,
+                    width: 40,
+                    height: 8,
+                },
+            ),
+        ];
+        // Click on first visible card → flat index 5 (NOT 0).
+        assert_eq!(hit_test_card(&rects, 5, 5), Some(5));
+        // Click on second → flat index 6.
+        assert_eq!(hit_test_card(&rects, 50, 5), Some(6));
+    }
+
+    #[test]
+    fn hit_test_card_empty_returns_none() {
+        assert_eq!(hit_test_card(&[], 10, 10), None);
     }
 }
