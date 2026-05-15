@@ -2379,6 +2379,17 @@ pub fn run_tui(
             ui.status_message = None;
         }
 
+        // Flip Working → Pending for sessions stalled at an interactive
+        // prompt with no corresponding hook event (typical Copilot CLI
+        // "1/2/3 — pick one" case). The transition takes a write lock
+        // and is gated to once per ~second; skipped when the configured
+        // timeout is 0 (feature disabled).
+        let pending_timeout_secs = ui.config.pending.timeout_seconds;
+        if pending_timeout_secs > 0 && tick.is_multiple_of(60) {
+            let timeout = chrono::Duration::seconds(pending_timeout_secs as i64);
+            let _ = state.blocking_write().apply_pending_timeout(timeout);
+        }
+
         let snapshot = state.blocking_read().clone();
 
         // Route new Bash commands through mode tabs for reactive panes.
@@ -4672,6 +4683,7 @@ fn render_stats_bar(
 
     let segments: &[(usize, &str, Color)] = &[
         (stats.working, "working", Color::Green),
+        (stats.pending, "pending", Color::Magenta),
         (stats.thinking, "thinking", Color::Blue),
         (stats.compacting, "compacting", Color::Magenta),
         (stats.waiting, "waiting", Color::Yellow),
@@ -5650,6 +5662,15 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
     match status {
         SessionStatus::Thinking => ("Thinking", Style::default().fg(Color::Cyan)),
         SessionStatus::Working => ("Working", Style::default().fg(Color::Yellow)),
+        // Pending is "agent stalled at an interactive prompt that has no
+        // hook event" — needs your attention but is gentler than the
+        // explicit permission prompt (which is `Needs Input` in red).
+        SessionStatus::Pending => (
+            "Pending",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
         SessionStatus::Compacting => ("Compacting", Style::default().fg(Color::Blue)),
         SessionStatus::WaitingForInput => (
             "Needs Input",

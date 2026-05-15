@@ -27,6 +27,14 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     ("bell.on_error", "Bell on agent error (default: true)"),
     (
+        "bell.on_pending",
+        "Bell when card transitions to Pending (default: true)",
+    ),
+    (
+        "pending.timeout_seconds",
+        "Seconds in Working before card flips to Pending (default: 10, set to 0 to disable)",
+    ),
+    (
         "idle_art.enabled",
         "Enable ASCII art in dashboard idle cards (default: false)",
     ),
@@ -77,6 +85,7 @@ pub fn socket_path() -> PathBuf {
 pub struct BellConfig {
     pub enabled: bool,
     pub on_waiting_for_input: bool,
+    pub on_pending: bool,
     pub on_idle: bool,
     pub on_error: bool,
 }
@@ -86,6 +95,7 @@ impl Default for BellConfig {
         Self {
             enabled: true,
             on_waiting_for_input: true,
+            on_pending: true,
             on_idle: false,
             on_error: true,
         }
@@ -99,6 +109,7 @@ impl BellConfig {
         }
         match status {
             SessionStatus::WaitingForInput => self.on_waiting_for_input,
+            SessionStatus::Pending => self.on_pending,
             SessionStatus::Idle => self.on_idle,
             SessionStatus::Error => self.on_error,
             _ => false,
@@ -130,9 +141,31 @@ impl Default for IdleArtConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct PendingConfig {
+    /// Seconds a session may sit in `Working` (without an active tool and
+    /// without any new events arriving) before dot-agent-deck flips its
+    /// status to `Pending`. The heuristic catches agents that have stalled
+    /// at an interactive prompt without firing a corresponding hook event
+    /// (e.g., Copilot CLI printing a multiple-choice menu and waiting on
+    /// stdin). Set to `0` to disable the transition entirely — the card
+    /// will keep displaying `Working` regardless of elapsed time.
+    pub timeout_seconds: u64,
+}
+
+impl Default for PendingConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DashboardConfig {
     pub default_command: String,
     pub bell: BellConfig,
+    pub pending: PendingConfig,
     pub theme: Theme,
     pub idle_art: IdleArtConfig,
     pub auto_config_prompt: bool,
@@ -143,6 +176,7 @@ impl Default for DashboardConfig {
         Self {
             default_command: String::new(),
             bell: BellConfig::default(),
+            pending: PendingConfig::default(),
             theme: Theme::default(),
             idle_art: IdleArtConfig::default(),
             auto_config_prompt: true,
@@ -189,6 +223,8 @@ impl DashboardConfig {
             "bell.on_waiting_for_input" => Ok(self.bell.on_waiting_for_input.to_string()),
             "bell.on_idle" => Ok(self.bell.on_idle.to_string()),
             "bell.on_error" => Ok(self.bell.on_error.to_string()),
+            "bell.on_pending" => Ok(self.bell.on_pending.to_string()),
+            "pending.timeout_seconds" => Ok(self.pending.timeout_seconds.to_string()),
             "idle_art.enabled" => Ok(self.idle_art.enabled.to_string()),
             "idle_art.provider" => Ok(self.idle_art.provider.clone()),
             "idle_art.model" => Ok(self.idle_art.model.clone()),
@@ -225,6 +261,17 @@ impl DashboardConfig {
             }
             "bell.on_error" => {
                 self.bell.on_error = parse_bool(value)?;
+                Ok(())
+            }
+            "bell.on_pending" => {
+                self.bell.on_pending = parse_bool(value)?;
+                Ok(())
+            }
+            "pending.timeout_seconds" => {
+                let secs: u64 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid number: {value}"))?;
+                self.pending.timeout_seconds = secs;
                 Ok(())
             }
             "idle_art.enabled" => {
@@ -876,6 +923,46 @@ on_idle = true
         assert!(!bc.should_bell(&SessionStatus::Thinking));
         assert!(!bc.should_bell(&SessionStatus::Working));
         assert!(!bc.should_bell(&SessionStatus::Compacting));
+        // Pending defaults to true — same family as WaitingForInput.
+        assert!(bc.should_bell(&SessionStatus::Pending));
+    }
+
+    #[test]
+    fn bell_on_pending_can_be_disabled() {
+        let bc = BellConfig {
+            on_pending: false,
+            ..Default::default()
+        };
+        assert!(!bc.should_bell(&SessionStatus::Pending));
+        // Other defaults still fire.
+        assert!(bc.should_bell(&SessionStatus::WaitingForInput));
+    }
+
+    #[test]
+    fn pending_timeout_seconds_default_is_10() {
+        let cfg = PendingConfig::default();
+        assert_eq!(cfg.timeout_seconds, 10);
+    }
+
+    #[test]
+    fn pending_timeout_get_set_field() {
+        let mut dc = DashboardConfig::default();
+        assert_eq!(dc.get_field("pending.timeout_seconds").unwrap(), "10");
+        dc.set_field("pending.timeout_seconds", "25").unwrap();
+        assert_eq!(dc.pending.timeout_seconds, 25);
+        // Zero disables the feature.
+        dc.set_field("pending.timeout_seconds", "0").unwrap();
+        assert_eq!(dc.pending.timeout_seconds, 0);
+        // Bad input rejected.
+        assert!(dc.set_field("pending.timeout_seconds", "abc").is_err());
+    }
+
+    #[test]
+    fn bell_on_pending_get_set_field() {
+        let mut dc = DashboardConfig::default();
+        assert_eq!(dc.get_field("bell.on_pending").unwrap(), "true");
+        dc.set_field("bell.on_pending", "false").unwrap();
+        assert!(!dc.bell.on_pending);
     }
 
     // -----------------------------------------------------------------------

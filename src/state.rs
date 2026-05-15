@@ -15,6 +15,14 @@ const MAX_FIRST_PROMPTS: usize = 3;
 pub enum SessionStatus {
     Thinking,
     Working,
+    /// Agent appears to be waiting for non-permission user input (e.g.,
+    /// a clarifying multiple-choice prompt printed to its pane). Inferred
+    /// from a heuristic in `AppState::apply_pending_timeout`: when an
+    /// agent has been in `Working` long enough with no active tool and
+    /// no new events, it has almost certainly stalled at an interactive
+    /// prompt. Distinct from `WaitingForInput`, which is the explicit
+    /// permission-prompt state hooked from `PermissionRequest` events.
+    Pending,
     Compacting,
     WaitingForInput,
     Idle,
@@ -25,6 +33,7 @@ pub enum SessionStatus {
 pub struct DashboardStats {
     pub active: usize,
     pub working: usize,
+    pub pending: usize,
     pub thinking: usize,
     pub waiting: usize,
     pub errors: usize,
@@ -88,6 +97,7 @@ impl AppState {
             stats.active += 1;
             match session.status {
                 SessionStatus::Working => stats.working += 1,
+                SessionStatus::Pending => stats.pending += 1,
                 SessionStatus::Thinking => stats.thinking += 1,
                 SessionStatus::WaitingForInput => stats.waiting += 1,
                 SessionStatus::Error => stats.errors += 1,
@@ -325,6 +335,34 @@ impl AppState {
         if session.recent_events.len() > MAX_RECENT_EVENTS {
             session.recent_events.pop_front();
         }
+    }
+
+    /// Walk every session and transition `Working` → `Pending` when the
+    /// session has been working for at least `timeout` without firing any
+    /// new event and without an active tool. This catches the case where
+    /// an agent stalls at an interactive prompt that has no corresponding
+    /// hook event (e.g., Copilot CLI printing a multiple-choice menu and
+    /// waiting on stdin).
+    ///
+    /// Returns the set of session IDs that just transitioned so callers
+    /// can fire a bell or update other side-effects exactly once per
+    /// transition.
+    pub fn apply_pending_timeout(&mut self, timeout: chrono::Duration) -> Vec<String> {
+        let now = Utc::now();
+        let mut transitioned = Vec::new();
+        for (sid, session) in self.sessions.iter_mut() {
+            if session.status != SessionStatus::Working {
+                continue;
+            }
+            if session.active_tool.is_some() {
+                continue;
+            }
+            if now.signed_duration_since(session.last_activity) >= timeout {
+                session.status = SessionStatus::Pending;
+                transitioned.push(sid.clone());
+            }
+        }
+        transitioned
     }
 }
 
@@ -980,5 +1018,131 @@ mod tests {
 
         assert_eq!(state.work_done_events.len(), 1);
         assert!(state.work_done_events[0].done);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending status: Working → Pending heuristic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pending_timeout_flips_stale_working_session_to_pending() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        // Tool finished — active_tool cleared, status still Working.
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert!(state.sessions["s1"].active_tool.is_none());
+
+        // Force last_activity into the past so the timeout matches.
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert_eq!(transitioned, vec!["s1".to_string()]);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
+    }
+
+    #[test]
+    fn pending_timeout_skips_sessions_with_active_tool() {
+        // A genuinely long-running tool (e.g., `cargo test`) keeps active_tool
+        // set throughout — the timeout must not flip it to Pending.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("Bash".into());
+        state.apply_event(tool);
+        // Push activity back so the duration check would otherwise trigger.
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(60);
+
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(transitioned.is_empty());
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn pending_timeout_ignores_non_working_statuses() {
+        // Thinking, Idle, WaitingForInput, Compacting, Error all stay.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        // Force last_activity into the past.
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(60);
+
+        for status in [
+            SessionStatus::Thinking,
+            SessionStatus::Idle,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Compacting,
+            SessionStatus::Error,
+        ] {
+            state.sessions.get_mut("s1").unwrap().status = status.clone();
+            let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+            assert!(
+                transitioned.is_empty(),
+                "should not transition from {status:?}"
+            );
+            assert_eq!(state.sessions["s1"].status, status);
+        }
+    }
+
+    #[test]
+    fn pending_timeout_below_threshold_does_not_fire() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        // last_activity is recent — duration is well under 10s.
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(transitioned.is_empty());
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn pending_clears_when_new_event_arrives() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+        state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
+
+        // User answers the prompt; agent fires another tool call.
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("Read".into());
+        state.apply_event(tool);
+        // ToolStart while status was Pending now drives back to Working.
+        // (status != WaitingForInput, so the existing guard lets it through.)
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn pending_status_counts_in_aggregate_stats() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+        state.apply_pending_timeout(chrono::Duration::seconds(10));
+
+        let stats = state.aggregate_stats();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.working, 0);
+    }
+
+    fn make_event_with_pane(session_id: &str, event_type: EventType, pane_id: &str) -> AgentEvent {
+        let mut ev = make_event(session_id, event_type);
+        ev.pane_id = Some(pane_id.to_string());
+        ev
     }
 }
