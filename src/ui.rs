@@ -2014,6 +2014,7 @@ pub fn run_tui(
     config: DashboardConfig,
     palette: ColorPalette,
     continue_session: bool,
+    workspace: Option<String>,
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2045,13 +2046,13 @@ pub fn run_tui(
         ui.mode = UiMode::StarPrompt;
     }
 
-    if continue_session {
+    if continue_session || workspace.is_some() {
         // Ensure the terminal has up-to-date dimensions before we resize
         // any PTYs — without this, get_frame().area() may return stale or
         // default values because no draw() call has happened yet.
         let _ = terminal.autoresize();
 
-        let saved = config::SavedSession::load();
+        let saved = config::SavedSession::load(workspace.as_deref());
         // Collect deferred mode pane restores — we need the terminal ready
         // before we can resize PTYs, so mode tabs are opened after the loop.
         let mut deferred_mode_panes: Vec<(config::SavedPane, ModeConfig)> = Vec::new();
@@ -3811,11 +3812,11 @@ pub fn run_tui(
             &live_panes,
         );
         if session.panes.is_empty() {
-            if let Err(e) = config::SavedSession::clear() {
+            if let Err(e) = config::SavedSession::clear(workspace.as_deref()) {
                 ui.session_warnings
                     .push(format!("Warning: failed to clear session: {e}"));
             }
-        } else if let Err(e) = session.save() {
+        } else if let Err(e) = session.save(workspace.as_deref()) {
             ui.session_warnings
                 .push(format!("Warning: failed to save session: {e}"));
         }

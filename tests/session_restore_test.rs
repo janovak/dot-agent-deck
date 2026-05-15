@@ -262,10 +262,10 @@ fn snapshot_save_load_round_trips_mode_field() {
     let pane_display_names: HashMap<String, String> = HashMap::new();
 
     let session = SavedSession::snapshot(&mut pane_metadata, &pane_display_names, &live_panes);
-    session.save().expect("save should succeed");
+    session.save(None).expect("save should succeed");
     assert!(path.exists(), "save must create session.toml");
 
-    let loaded = SavedSession::load();
+    let loaded = SavedSession::load(None);
     assert_eq!(loaded.panes.len(), 1);
     assert_eq!(
         loaded.panes[0].mode.as_deref(),
@@ -308,10 +308,10 @@ fn save_then_restore_recreates_side_panes() {
     let live_panes: HashSet<String> = ["42".to_string()].into_iter().collect();
     let pane_display_names: HashMap<String, String> = HashMap::new();
     let session = SavedSession::snapshot(&mut pane_metadata, &pane_display_names, &live_panes);
-    session.save().unwrap();
+    session.save(None).unwrap();
 
     // ---- Restore side ----
-    let loaded = SavedSession::load();
+    let loaded = SavedSession::load(None);
     assert_eq!(loaded.panes.len(), 1);
     let restored = &loaded.panes[0];
     let mode_name = restored
@@ -358,7 +358,7 @@ fn save_then_restore_recreates_side_panes() {
 //
 // Pins the backwards-compatibility contract provided by `#[serde(default)]`
 // on `SavedPane.mode`. If a future change breaks that contract,
-// `SavedSession::load()` would log "Invalid session at..." and return
+// `SavedSession::load(None)` would log "Invalid session at..." and return
 // `Self::default()` (empty panes), failing the pane-count assertion.
 // ---------------------------------------------------------------------------
 
@@ -385,7 +385,7 @@ command = "npm run dev"
     std::fs::write(&path, legacy).unwrap();
     let _guard = SessionEnvGuard::set(path.to_str().unwrap());
 
-    let loaded = SavedSession::load();
+    let loaded = SavedSession::load(None);
     assert_eq!(loaded.panes.len(), 3);
     assert!(
         loaded.panes.iter().all(|p| p.mode.is_none()),

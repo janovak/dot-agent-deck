@@ -276,6 +276,107 @@ fn session_path() -> PathBuf {
     dirs_home().join(".config/dot-agent-deck/session.toml")
 }
 
+/// Root directory for named workspaces. Each workspace lives at
+/// `<root>/<sanitized_name>.toml`.
+pub fn workspaces_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("DOT_AGENT_DECK_WORKSPACES") {
+        return PathBuf::from(dir);
+    }
+    dirs_home().join(".config/dot-agent-deck/workspaces")
+}
+
+/// Resolve the on-disk path for a workspace, or the default session file when
+/// no workspace name is given.
+///
+/// Returns an error if the name contains anything other than ASCII letters,
+/// digits, dashes, or underscores — that guards against path traversal
+/// (`../foo`), shell weirdness (`.`, spaces), and platform-specific reserved
+/// names. Reserved Windows device names (`con`, `prn`, `aux`, `nul`, `com1`,
+/// `lpt1`, etc.) are also rejected.
+pub fn workspace_session_path(name: Option<&str>) -> Result<PathBuf, String> {
+    match name {
+        None => Ok(session_path()),
+        Some(raw) => {
+            validate_workspace_name(raw)?;
+            Ok(workspaces_dir().join(format!("{raw}.toml")))
+        }
+    }
+}
+
+/// Returns `Ok` if `name` is safe to use as a filename component for a
+/// workspace file: 1–64 chars of `[A-Za-z0-9_-]` and not a Windows reserved
+/// device name.
+pub fn validate_workspace_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Workspace name cannot be empty".to_string());
+    }
+    if name.len() > 64 {
+        return Err(format!(
+            "Workspace name '{name}' is too long (max 64 characters)"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "Workspace name '{name}' contains invalid characters \
+             (only letters, digits, '-' and '_' are allowed)"
+        ));
+    }
+    // Windows reserved device names — case-insensitive, no extension.
+    const RESERVED: &[&str] = &[
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    if RESERVED.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(format!(
+            "Workspace name '{name}' conflicts with a reserved system name"
+        ));
+    }
+    Ok(())
+}
+
+/// List all named workspaces present on disk, sorted alphabetically.
+/// Returns an empty `Vec` if the workspaces directory does not exist yet
+/// (i.e., the user has never saved a named workspace).
+pub fn list_workspaces() -> Vec<String> {
+    let dir = workspaces_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(it) => it,
+        Err(_) => return Vec::new(),
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?.to_string();
+            // Defence-in-depth: only return names we'd accept back as input.
+            if validate_workspace_name(&stem).is_ok() {
+                Some(stem)
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Delete the named workspace from disk. Returns `Ok(true)` if a file was
+/// removed, `Ok(false)` if no such workspace existed.
+pub fn delete_workspace(name: &str) -> Result<bool, String> {
+    let path = workspace_session_path(Some(name))?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("Failed to delete {}: {e}", path.display())),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedPane {
     pub dir: String,
@@ -294,8 +395,17 @@ pub struct SavedSession {
 }
 
 impl SavedSession {
-    pub fn load() -> Self {
-        let path = session_path();
+    /// Load the saved session for the given workspace (or the default
+    /// unnamed session when `workspace` is `None`). Missing files
+    /// produce an empty session, not an error.
+    pub fn load(workspace: Option<&str>) -> Self {
+        let path = match workspace_session_path(workspace) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("{err}");
+                return Self::default();
+            }
+        };
         match std::fs::read_to_string(&path) {
             Ok(contents) => match toml::from_str(&contents) {
                 Ok(session) => session,
@@ -312,8 +422,10 @@ impl SavedSession {
         }
     }
 
-    pub fn save(&self) -> Result<(), String> {
-        let path = session_path();
+    /// Write the session to the given workspace's file (or the default
+    /// unnamed session when `workspace` is `None`).
+    pub fn save(&self, workspace: Option<&str>) -> Result<(), String> {
+        let path = workspace_session_path(workspace)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create session directory: {e}"))?;
@@ -324,8 +436,15 @@ impl SavedSession {
             .map_err(|e| format!("Failed to write session at {}: {e}", path.display()))
     }
 
-    pub fn clear() -> Result<(), std::io::Error> {
-        let path = session_path();
+    /// Delete the saved session file for the given workspace.
+    pub fn clear(workspace: Option<&str>) -> Result<(), std::io::Error> {
+        let path = match workspace_session_path(workspace) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("{err}");
+                return Ok(());
+            }
+        };
         match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -556,6 +675,10 @@ pub(crate) fn dirs_home() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate `DOT_AGENT_DECK_WORKSPACES`. Cargo runs
+    /// unit tests in parallel and they otherwise race on the shared env var.
+    static WORKSPACES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn bell_config_defaults() {
         let bc = BellConfig::default();
@@ -684,7 +807,7 @@ on_idle = true
         }
 
         // Load returns default when file missing
-        let session = SavedSession::load();
+        let session = SavedSession::load(None);
         assert!(session.panes.is_empty());
 
         // Save then load round-trips
@@ -696,13 +819,13 @@ on_idle = true
                 mode: None,
             }],
         };
-        session.save().unwrap();
-        let loaded = SavedSession::load();
+        session.save(None).unwrap();
+        let loaded = SavedSession::load(None);
         assert_eq!(loaded.panes.len(), 1);
         assert_eq!(loaded.panes[0].dir, "/tmp/test");
 
         // Clear removes the file
-        SavedSession::clear().unwrap();
+        SavedSession::clear(None).unwrap();
         assert!(!path.exists());
 
         // SAFETY: test cleanup — restore original env var.
@@ -723,6 +846,227 @@ on_idle = true
         assert!(!bc.should_bell(&SessionStatus::Thinking));
         assert!(!bc.should_bell(&SessionStatus::Working));
         assert!(!bc.should_bell(&SessionStatus::Compacting));
+    }
+
+    // -----------------------------------------------------------------------
+    // Named workspaces
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn workspace_name_accepts_valid_inputs() {
+        assert!(validate_workspace_name("client-x").is_ok());
+        assert!(validate_workspace_name("client_X_2026").is_ok());
+        assert!(validate_workspace_name("A").is_ok());
+        assert!(validate_workspace_name("a-b_c-1").is_ok());
+        // 64 chars is the maximum.
+        let max = "a".repeat(64);
+        assert!(validate_workspace_name(&max).is_ok());
+    }
+
+    #[test]
+    fn workspace_name_rejects_invalid_inputs() {
+        assert!(validate_workspace_name("").is_err());
+        assert!(validate_workspace_name(".").is_err());
+        assert!(validate_workspace_name("..").is_err());
+        assert!(validate_workspace_name("../sneaky").is_err());
+        assert!(validate_workspace_name("with space").is_err());
+        assert!(validate_workspace_name("with/slash").is_err());
+        assert!(validate_workspace_name("with\\slash").is_err());
+        assert!(validate_workspace_name("with:colon").is_err());
+        assert!(validate_workspace_name("foo.toml").is_err());
+        assert!(validate_workspace_name("emoji😀").is_err());
+        // 65 chars is one past the maximum.
+        let too_long = "a".repeat(65);
+        assert!(validate_workspace_name(&too_long).is_err());
+    }
+
+    #[test]
+    fn workspace_name_rejects_windows_reserved() {
+        for name in ["con", "CON", "Con", "prn", "aux", "nul", "com1", "lpt9"] {
+            assert!(
+                validate_workspace_name(name).is_err(),
+                "expected '{name}' to be rejected as a reserved name"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_session_path_returns_default_for_none() {
+        let prev = std::env::var("DOT_AGENT_DECK_SESSION").ok();
+        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_SESSION", "/tmp/dot-agent-deck-test.toml");
+        }
+        let path = workspace_session_path(None).unwrap();
+        assert_eq!(path.to_string_lossy(), "/tmp/dot-agent-deck-test.toml");
+        // SAFETY: restore env var to original value.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SESSION", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SESSION"),
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_session_path_resolves_under_workspaces_dir() {
+        let _guard = WORKSPACES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("DOT_AGENT_DECK_WORKSPACES").ok();
+        // SAFETY: test is single-threaded.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_WORKSPACES", "/tmp/ws-test");
+        }
+        let path = workspace_session_path(Some("client-x")).unwrap();
+        assert!(
+            path.to_string_lossy().ends_with("client-x.toml"),
+            "path was {}",
+            path.display()
+        );
+        assert!(
+            path.to_string_lossy().contains("ws-test"),
+            "path was {}",
+            path.display()
+        );
+        // SAFETY: restore env var to original value.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_WORKSPACES", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_WORKSPACES"),
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_session_path_rejects_invalid_name() {
+        assert!(workspace_session_path(Some("../sneaky")).is_err());
+        assert!(workspace_session_path(Some("")).is_err());
+    }
+
+    #[test]
+    fn workspace_save_load_clear_round_trip() {
+        let _guard = WORKSPACES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DOT_AGENT_DECK_WORKSPACES").ok();
+        // SAFETY: test is single-threaded.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_WORKSPACES", dir.path().to_str().unwrap());
+        }
+
+        // Missing workspace loads as empty.
+        let empty = SavedSession::load(Some("alpha"));
+        assert!(empty.panes.is_empty());
+
+        // Save then load round-trips.
+        let session = SavedSession {
+            panes: vec![SavedPane {
+                dir: "/tmp/proj".to_string(),
+                name: "proj".to_string(),
+                command: "claude".to_string(),
+                mode: None,
+            }],
+        };
+        session.save(Some("alpha")).unwrap();
+        let loaded = SavedSession::load(Some("alpha"));
+        assert_eq!(loaded.panes.len(), 1);
+        assert_eq!(loaded.panes[0].name, "proj");
+
+        // Saving to a *different* workspace name produces a separate file.
+        let other = SavedSession {
+            panes: vec![SavedPane {
+                dir: "/tmp/other".to_string(),
+                name: "other".to_string(),
+                command: "opencode".to_string(),
+                mode: None,
+            }],
+        };
+        other.save(Some("beta")).unwrap();
+        assert_eq!(SavedSession::load(Some("alpha")).panes[0].command, "claude");
+        assert_eq!(
+            SavedSession::load(Some("beta")).panes[0].command,
+            "opencode"
+        );
+
+        // Clear removes only the named workspace.
+        SavedSession::clear(Some("alpha")).unwrap();
+        assert!(SavedSession::load(Some("alpha")).panes.is_empty());
+        assert_eq!(SavedSession::load(Some("beta")).panes.len(), 1);
+
+        // SAFETY: restore env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_WORKSPACES", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_WORKSPACES"),
+            }
+        }
+    }
+
+    #[test]
+    fn list_workspaces_returns_sorted_stems() {
+        let _guard = WORKSPACES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DOT_AGENT_DECK_WORKSPACES").ok();
+        // SAFETY: test is single-threaded.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_WORKSPACES", dir.path().to_str().unwrap());
+        }
+
+        // Empty directory → empty list.
+        assert!(list_workspaces().is_empty());
+
+        // Create three workspace files and one non-toml file.
+        let session = SavedSession::default();
+        session.save(Some("zeta")).unwrap();
+        session.save(Some("alpha")).unwrap();
+        session.save(Some("middle")).unwrap();
+        std::fs::write(dir.path().join("not-a-workspace.txt"), "ignore me").unwrap();
+        // Also drop a file with an invalid stem to confirm it's filtered out.
+        std::fs::write(dir.path().join("with space.toml"), "panes = []").unwrap();
+
+        let workspaces = list_workspaces();
+        assert_eq!(workspaces, vec!["alpha", "middle", "zeta"]);
+
+        // SAFETY: restore env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_WORKSPACES", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_WORKSPACES"),
+            }
+        }
+    }
+
+    #[test]
+    fn delete_workspace_returns_true_when_removed_false_when_absent() {
+        let _guard = WORKSPACES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DOT_AGENT_DECK_WORKSPACES").ok();
+        // SAFETY: test is single-threaded.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_WORKSPACES", dir.path().to_str().unwrap());
+        }
+
+        // Nothing to delete yet.
+        assert!(!delete_workspace("nope").unwrap());
+
+        // Create and delete.
+        SavedSession::default().save(Some("transient")).unwrap();
+        assert!(delete_workspace("transient").unwrap());
+        assert!(!delete_workspace("transient").unwrap());
+
+        // SAFETY: restore env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_WORKSPACES", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_WORKSPACES"),
+            }
+        }
     }
 
     #[test]

@@ -16,8 +16,16 @@ use dot_agent_deck::ui::run_tui;
 #[command(name = "dot-agent-deck", about = "AI agent session dashboard", version = env!("DAD_VERSION"))]
 struct Cli {
     /// Restore pane session from last exit
-    #[arg(long = "continue")]
+    #[arg(long = "continue", conflicts_with = "workspace")]
     continue_session: bool,
+
+    /// Load (and on exit save) a named workspace under
+    /// `~/.config/dot-agent-deck/workspaces/<NAME>.toml`. If the named
+    /// workspace doesn't exist yet, the dashboard starts blank and the
+    /// workspace file is created on exit. Name must be 1–64 chars of
+    /// `[A-Za-z0-9_-]`.
+    #[arg(long = "workspace", value_name = "NAME")]
+    workspace: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -111,6 +119,22 @@ enum Commands {
         #[arg(long)]
         done: bool,
     },
+    /// Manage named workspaces (saved pane layouts)
+    Workspaces {
+        #[command(subcommand)]
+        action: WorkspacesAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspacesAction {
+    /// List all saved workspaces
+    List,
+    /// Delete a saved workspace
+    Delete {
+        /// Workspace name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -160,7 +184,14 @@ fn main() -> ExitCode {
 
     match cli.command {
         None => {
-            run_dashboard(cli.theme, cli.continue_session);
+            // Fail fast on a bad workspace name before any UI setup.
+            if let Some(ref name) = cli.workspace
+                && let Err(e) = dot_agent_deck::config::validate_workspace_name(name)
+            {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+            run_dashboard(cli.theme, cli.continue_session, cli.workspace);
             ExitCode::SUCCESS
         }
         Some(Commands::Hook { agent, event }) => {
@@ -354,11 +385,50 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Commands::Workspaces { action }) => match action {
+            WorkspacesAction::List => {
+                let workspaces = dot_agent_deck::config::list_workspaces();
+                if workspaces.is_empty() {
+                    println!(
+                        "(no named workspaces yet — start one with `dot-agent-deck --workspace <name>`)"
+                    );
+                } else {
+                    for name in workspaces {
+                        println!("{name}");
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            WorkspacesAction::Delete { name } => {
+                if let Err(e) = dot_agent_deck::config::validate_workspace_name(&name) {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+                match dot_agent_deck::config::delete_workspace(&name) {
+                    Ok(true) => {
+                        println!("Deleted workspace '{name}'");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(false) => {
+                        eprintln!("No workspace named '{name}'");
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        },
     }
 }
 
 #[tokio::main]
-async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
+async fn run_dashboard(
+    cli_theme: Option<Theme>,
+    continue_session: bool,
+    workspace: Option<String>,
+) {
     // Optional file-based logging when DOT_AGENT_DECK_LOG is set.
     // Logs go to the file path specified (e.g., DOT_AGENT_DECK_LOG=/tmp/dad.log
     // on Unix, or DOT_AGENT_DECK_LOG=C:\path\to\log.txt on Windows).
@@ -438,6 +508,7 @@ async fn run_dashboard(cli_theme: Option<Theme>, continue_session: bool) {
             config,
             palette,
             continue_session,
+            workspace,
         )
     })
     .await;

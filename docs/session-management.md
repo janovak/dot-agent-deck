@@ -55,3 +55,37 @@ After restore the dashboard is shown first so you get an overview before switchi
 Mode tabs are also restored: each agent pane records which mode it belonged to, and `--continue` reopens the full mode tab — tab name, agent pane and its command, and all side panes with their commands — by looking up the mode config from the project's `.dot-agent-deck.toml`. The agent's internal conversation state is not restored; only the workspace structure is. If `.dot-agent-deck.toml` is missing or the mode was renamed at restore time, a warning is printed to stderr and the pane falls back to a plain dashboard pane.
 
 Session data is stored in `~/.config/dot-agent-deck/session.toml`.
+
+## Named Workspaces
+
+For switching between different sets of sessions, use **named workspaces**. Each workspace is a separate save file, so you can keep one set of panes for `client-x`, another for `personal`, etc., without one overwriting the other.
+
+```bash
+dot-agent-deck --workspace client-x         # load (or start fresh if new)
+dot-agent-deck --workspace personal         # different set of panes
+dot-agent-deck --workspace work-server      # yet another set
+```
+
+The first time you use a workspace name, the dashboard starts blank and creates the file on exit. From then on, that workspace's panes are restored every time you launch with the same `--workspace` flag — same behaviour as `--continue` but scoped to the named slot.
+
+### Save semantics
+
+Workspaces auto-save **on exit**. Whatever panes are open when you quit dot-agent-deck become the new contents of the workspace file. There's no explicit "save" — just open the panes you want and quit normally. If you accidentally close a pane and quit, that pane is gone from the workspace until you re-open it.
+
+### Listing and deleting workspaces
+
+```bash
+dot-agent-deck workspaces list              # list all saved workspaces
+dot-agent-deck workspaces delete client-x   # delete one
+```
+
+### Constraints
+
+- Workspace names must be 1–64 characters from `[A-Za-z0-9_-]`. No spaces, slashes, dots, or other punctuation. Windows reserved device names (`con`, `prn`, `aux`, `nul`, `com1`…`com9`, `lpt1`…`lpt9`) are rejected.
+- `--continue` and `--workspace` are mutually exclusive — pick one.
+- The agent's internal conversation state still isn't restored (same caveat as `--continue`). Use `claude --continue` or `opencode --resume` as the pane's saved command if you want the agent to resume its prior conversation.
+
+### Where files live
+
+- Default unnamed session: `~/.config/dot-agent-deck/session.toml`
+- Named workspaces: `~/.config/dot-agent-deck/workspaces/<name>.toml`
