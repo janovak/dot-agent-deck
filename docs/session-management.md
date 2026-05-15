@@ -70,7 +70,7 @@ The first time you use a workspace name, the dashboard starts blank and creates 
 
 ### Save semantics
 
-Workspaces auto-save **on exit**. Whatever panes are open when you quit dot-agent-deck become the new contents of the workspace file. There's no explicit "save" — just open the panes you want and quit normally. If you accidentally close a pane and quit, that pane is gone from the workspace until you re-open it.
+Workspaces auto-save **after every pane open, close, or rename**, plus a final write when you exit cleanly. The save is incremental: dot-agent-deck only writes when the current snapshot differs from what's already on disk, so steady-state runs do zero disk I/O. This means closing the terminal window without quitting cleanly *still* leaves a recent snapshot — at most one frame of state can be lost (typically less than 16 ms of activity).
 
 ### Listing and deleting workspaces
 

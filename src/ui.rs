@@ -519,6 +519,15 @@ struct UiState {
     orchestration_created_at: HashMap<TabId, std::time::Instant>,
     /// Prompts waiting to be injected into panes once their agent is ready (M5 dispatch).
     pending_dispatches: Vec<PendingDispatch>,
+    /// Active workspace name (None means the default unnamed session).
+    /// Stashed from the `--workspace` CLI flag so per-loop auto-save knows
+    /// which file to write.
+    workspace: Option<String>,
+    /// Last successfully written `SavedSession` for the active workspace.
+    /// The auto-save loop computes a fresh snapshot every outer iteration
+    /// and writes only when the snapshot differs from this value, so
+    /// steady-state runs (no pane open/close/rename) do no disk I/O.
+    last_saved_session: Option<config::SavedSession>,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -574,6 +583,8 @@ impl UiState {
             orchestration_prompted: HashSet::new(),
             orchestration_created_at: HashMap::new(),
             pending_dispatches: Vec::new(),
+            workspace: None,
+            last_saved_session: None,
         }
     }
 }
@@ -1054,6 +1065,51 @@ fn feedback_worker_results(
                 prompt: feedback,
                 created_at: std::time::Instant::now(),
             });
+        }
+    }
+}
+
+/// Auto-save the current session/workspace if it has changed since the last
+/// write. Called once per outer event-loop iteration so every pane open,
+/// close, or rename gets persisted within a frame — no need to quit
+/// dot-agent-deck cleanly for the workspace to capture the latest state
+/// (e.g., closing the terminal window still leaves a recent snapshot on
+/// disk).
+///
+/// Compares the snapshot to `ui.last_saved_session` (a clone of whatever
+/// was last successfully written). If they match, no disk I/O happens —
+/// steady-state runs are free. On mismatch, writes via
+/// `SavedSession::save(ui.workspace)` (or `clear` when the snapshot is
+/// empty) and updates `last_saved_session` on success.
+fn auto_save_workspace(ui: &mut UiState, state: &SharedState) {
+    let live_panes = state.blocking_read().managed_pane_ids.clone();
+    let current =
+        config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
+    if ui.last_saved_session.as_ref() == Some(&current) {
+        return;
+    }
+    let workspace = ui.workspace.clone();
+    let result = if current.panes.is_empty() {
+        config::SavedSession::clear(workspace.as_deref()).map_err(|e| e.to_string())
+    } else {
+        current.save(workspace.as_deref())
+    };
+    match result {
+        Ok(()) => {
+            ui.last_saved_session = Some(current);
+        }
+        Err(e) => {
+            // Surface once, then suppress further messages from the same
+            // failed write to avoid filling the status bar every frame.
+            let warning = format!("Workspace auto-save failed: {e}");
+            let already_warned = ui
+                .session_warnings
+                .last()
+                .map(|w| w == &warning)
+                .unwrap_or(false);
+            if !already_warned {
+                ui.session_warnings.push(warning);
+            }
         }
     }
 }
@@ -2037,6 +2093,7 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, palette);
+    ui.workspace = workspace.clone();
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -2273,6 +2330,19 @@ pub fn run_tui(
             }
         }
         ui.selected_index = 0;
+    }
+
+    // Seed `last_saved_session` with whatever we just restored (or the empty
+    // session if we started blank) so the auto-save loop below won't fire
+    // a redundant write on the very first iteration.
+    {
+        let live_panes = state.blocking_read().managed_pane_ids.clone();
+        let seeded = config::SavedSession::snapshot(
+            &mut ui.pane_metadata,
+            &ui.pane_display_names,
+            &live_panes,
+        );
+        ui.last_saved_session = Some(seeded);
     }
 
     'outer: loop {
@@ -3796,6 +3866,11 @@ pub fn run_tui(
                 &snapshot,
             );
         }
+
+        // Persist any pane open/close/rename that happened this frame.
+        // The helper is a no-op when the snapshot hasn't changed, so
+        // steady-state runs do zero disk I/O.
+        auto_save_workspace(&mut ui, &state);
     }
 
     // Snapshot the session for --continue restore *before* tearing down mode

@@ -377,7 +377,7 @@ pub fn delete_workspace(name: &str) -> Result<bool, String> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedPane {
     pub dir: String,
     pub name: String,
@@ -388,7 +388,7 @@ pub struct SavedPane {
     pub mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SavedSession {
     #[serde(default)]
     pub panes: Vec<SavedPane>,
