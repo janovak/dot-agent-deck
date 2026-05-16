@@ -1,0 +1,2 @@
+- **Bell Suppressed When You're Already Looking at the Stalled Pane**
+  When a card transitions to `Pending` (or `WaitingForInput`, `Error`, etc.) the bell now stays silent if the user is already in PaneInput mode focused on that session's pane — you've already engaged, so the audible alert would be noise. Bells for *other* sessions are unaffected. As soon as you leave PaneInput (Ctrl+d), suppression lifts; if the same session bounces Working → Pending again from the dashboard view, the bell rings normally.

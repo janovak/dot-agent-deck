@@ -1176,6 +1176,8 @@ fn compute_bell_needed(
     sessions: &HashMap<String, SessionState>,
     last_bell_status: &HashMap<String, SessionStatus>,
     bell_config: &BellConfig,
+    focused_pane_id: Option<&str>,
+    in_pane_input_mode: bool,
 ) -> (bool, HashMap<String, SessionStatus>) {
     let mut need_bell = false;
     let mut new_status_map = HashMap::with_capacity(sessions.len());
@@ -1184,7 +1186,19 @@ fn compute_bell_needed(
         let current = &session.status;
         let changed = last_bell_status.get(id) != Some(current);
 
-        if changed && bell_config.should_bell(current) {
+        // Suppress the bell for the session whose pane is currently focused
+        // in PaneInput mode — the user is actively engaged with it, so an
+        // audible alert is redundant. Other sessions still bell normally.
+        // `last_bell_status` is still updated so subsequent transitions are
+        // computed correctly.
+        let user_is_engaged = in_pane_input_mode
+            && session
+                .pane_id
+                .as_deref()
+                .zip(focused_pane_id)
+                .is_some_and(|(p, f)| p == f);
+
+        if changed && bell_config.should_bell(current) && !user_is_engaged {
             need_bell = true;
         }
 
@@ -2589,9 +2603,21 @@ pub fn run_tui(
         })?;
         tick = tick.wrapping_add(1);
 
-        // Bell transition detection
-        let (need_bell, new_bell_status) =
-            compute_bell_needed(&snapshot.sessions, &ui.last_bell_status, &ui.config.bell);
+        // Bell transition detection. Includes the currently-focused pane
+        // + UI mode so the bell is suppressed for the one session the user
+        // is actively engaged with (PaneInput on its pane).
+        let focused_pane = pane
+            .as_any()
+            .downcast_ref::<EmbeddedPaneController>()
+            .and_then(|e| e.focused_pane_id());
+        let in_pane_input_mode = ui.mode == UiMode::PaneInput;
+        let (need_bell, new_bell_status) = compute_bell_needed(
+            &snapshot.sessions,
+            &ui.last_bell_status,
+            &ui.config.bell,
+            focused_pane.as_deref(),
+            in_pane_input_mode,
+        );
         ui.last_bell_status = new_bell_status;
         if need_bell {
             use std::io::Write;
@@ -6908,6 +6934,12 @@ mod tests {
         }
     }
 
+    fn make_session_with_pane(status: SessionStatus, pane_id: &str) -> SessionState {
+        let mut s = make_session(status);
+        s.pane_id = Some(pane_id.to_string());
+        s
+    }
+
     #[test]
     fn bell_on_transition_to_waiting() {
         let mut sessions = HashMap::new();
@@ -6916,7 +6948,8 @@ mod tests {
         let mut last = HashMap::new();
         last.insert("a".into(), SessionStatus::Working);
 
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, _) =
+            compute_bell_needed(&sessions, &last, &BellConfig::default(), None, false);
         assert!(need_bell);
     }
 
@@ -6928,7 +6961,8 @@ mod tests {
         let mut last = HashMap::new();
         last.insert("a".into(), SessionStatus::WaitingForInput);
 
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, _) =
+            compute_bell_needed(&sessions, &last, &BellConfig::default(), None, false);
         assert!(!need_bell);
     }
 
@@ -6941,7 +6975,8 @@ mod tests {
         last.insert("a".into(), SessionStatus::Working);
 
         // Default config has on_idle = false
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, _) =
+            compute_bell_needed(&sessions, &last, &BellConfig::default(), None, false);
         assert!(!need_bell);
     }
 
@@ -6957,7 +6992,7 @@ mod tests {
             on_idle: true,
             ..Default::default()
         };
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config, None, false);
         assert!(need_bell);
     }
 
@@ -6972,7 +7007,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config, None, false);
         assert!(!need_bell);
     }
 
@@ -6986,7 +7021,8 @@ mod tests {
         last.insert("a".into(), SessionStatus::Working);
         last.insert("b".into(), SessionStatus::Working);
 
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, _) =
+            compute_bell_needed(&sessions, &last, &BellConfig::default(), None, false);
         assert!(need_bell);
     }
 
@@ -6997,7 +7033,8 @@ mod tests {
         let mut last = HashMap::new();
         last.insert("gone".into(), SessionStatus::Working);
 
-        let (_, new_map) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (_, new_map) =
+            compute_bell_needed(&sessions, &last, &BellConfig::default(), None, false);
         assert!(!new_map.contains_key("gone"));
     }
 
@@ -7008,9 +7045,155 @@ mod tests {
 
         let last = HashMap::new(); // empty — session is brand new
 
-        let (need_bell, new_map) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, new_map) =
+            compute_bell_needed(&sessions, &last, &BellConfig::default(), None, false);
         assert!(need_bell);
         assert_eq!(new_map.get("new"), Some(&SessionStatus::WaitingForInput));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bell suppression when the user is engaged with the agent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bell_suppressed_when_focused_pane_matches_session_in_pane_input() {
+        // Transition to Pending while focused on that session's pane in
+        // PaneInput mode → no bell (user is already engaged).
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "s1".into(),
+            make_session_with_pane(SessionStatus::Pending, "pane-1"),
+        );
+
+        let mut last = HashMap::new();
+        last.insert("s1".into(), SessionStatus::Working);
+
+        let (need_bell, new_map) = compute_bell_needed(
+            &sessions,
+            &last,
+            &BellConfig::default(),
+            Some("pane-1"), // focused on this session's pane
+            true,           // in PaneInput
+        );
+        assert!(!need_bell);
+        // last_bell_status still updated so subsequent transitions are correct.
+        assert_eq!(new_map.get("s1"), Some(&SessionStatus::Pending));
+    }
+
+    #[test]
+    fn bell_fires_when_focused_pane_is_different_session() {
+        // Pane A is focused; pane B's session goes Pending → bell rings for B.
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "sA".into(),
+            make_session_with_pane(SessionStatus::Working, "pane-A"),
+        );
+        sessions.insert(
+            "sB".into(),
+            make_session_with_pane(SessionStatus::Pending, "pane-B"),
+        );
+
+        let mut last = HashMap::new();
+        last.insert("sA".into(), SessionStatus::Working);
+        last.insert("sB".into(), SessionStatus::Working);
+
+        let (need_bell, _) = compute_bell_needed(
+            &sessions,
+            &last,
+            &BellConfig::default(),
+            Some("pane-A"), // focused on A, not B
+            true,
+        );
+        assert!(need_bell);
+    }
+
+    #[test]
+    fn bell_fires_when_not_in_pane_input_even_if_pane_matches() {
+        // Same pane, but user is on dashboard (Normal mode) → bell rings.
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "s1".into(),
+            make_session_with_pane(SessionStatus::Pending, "pane-1"),
+        );
+
+        let mut last = HashMap::new();
+        last.insert("s1".into(), SessionStatus::Working);
+
+        let (need_bell, _) = compute_bell_needed(
+            &sessions,
+            &last,
+            &BellConfig::default(),
+            Some("pane-1"),
+            false, // Normal mode, not PaneInput
+        );
+        assert!(need_bell);
+    }
+
+    #[test]
+    fn bell_fires_when_pane_input_but_no_focused_pane() {
+        // Edge case: PaneInput mode but no pane is focused (shouldn't normally
+        // happen, but be defensive). Bell should still fire.
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "s1".into(),
+            make_session_with_pane(SessionStatus::Pending, "pane-1"),
+        );
+
+        let mut last = HashMap::new();
+        last.insert("s1".into(), SessionStatus::Working);
+
+        let (need_bell, _) =
+            compute_bell_needed(&sessions, &last, &BellConfig::default(), None, true);
+        assert!(need_bell);
+    }
+
+    #[test]
+    fn bell_suppression_only_affects_matching_session() {
+        // Two sessions both transition to a bell-worthy status. User is in
+        // PaneInput on session A's pane. A's bell is suppressed; B's still rings.
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "sA".into(),
+            make_session_with_pane(SessionStatus::Pending, "pane-A"),
+        );
+        sessions.insert(
+            "sB".into(),
+            make_session_with_pane(SessionStatus::Pending, "pane-B"),
+        );
+
+        let mut last = HashMap::new();
+        last.insert("sA".into(), SessionStatus::Working);
+        last.insert("sB".into(), SessionStatus::Working);
+
+        // Engaged with A → still need bell because B is unfocused.
+        let (need_bell, _) = compute_bell_needed(
+            &sessions,
+            &last,
+            &BellConfig::default(),
+            Some("pane-A"),
+            true,
+        );
+        assert!(need_bell);
+
+        // Engaged with B → still need bell because A is unfocused.
+        let (need_bell, _) = compute_bell_needed(
+            &sessions,
+            &last,
+            &BellConfig::default(),
+            Some("pane-B"),
+            true,
+        );
+        assert!(need_bell);
+
+        // Not engaged with either pane (e.g., focused on a third) → both ring.
+        let (need_bell, _) = compute_bell_needed(
+            &sessions,
+            &last,
+            &BellConfig::default(),
+            Some("pane-C"),
+            true,
+        );
+        assert!(need_bell);
     }
 
     // ---------------------------------------------------------------------------
