@@ -62,6 +62,13 @@ pub struct SessionState {
     pub last_user_prompt: Option<String>,
     pub first_prompts: Vec<String>,
     pub pane_id: Option<String>,
+    /// Net count of subagents the parent has spawned that have not yet
+    /// reported `SubagentStop`. Used to keep the card showing `Working`
+    /// while background subagents are running, instead of letting the
+    /// parent's own `sessionEnd` (reason=complete) flip the card to
+    /// `Idle` prematurely. Saturating: never goes negative if events
+    /// arrive in an unexpected order.
+    pub active_subagent_count: u32,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -133,6 +140,7 @@ impl AppState {
                 tool_count: 0,
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
+                active_subagent_count: 0,
                 pane_id: Some(pane_id),
             },
         );
@@ -262,6 +270,7 @@ impl AppState {
                 tool_count: 0,
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
+                active_subagent_count: 0,
                 pane_id: event.pane_id.clone(),
             });
 
@@ -315,15 +324,51 @@ impl AppState {
                 session.status = SessionStatus::WaitingForInput;
             }
             EventType::Idle => {
-                session.status = SessionStatus::Idle;
+                // Don't flip the card to Idle while background subagents are
+                // still running. The parent agent's `sessionEnd` (reason=
+                // "complete") fires at the end of every conversation turn,
+                // including the turn where the parent just dispatched
+                // subagents and is now waiting on them — without this guard
+                // the card would mislead the user into thinking nothing is
+                // happening.
+                if session.active_subagent_count > 0 {
+                    session.status = SessionStatus::Working;
+                } else {
+                    session.status = SessionStatus::Idle;
+                }
                 session.active_tool = None;
             }
             EventType::Compacting => {
                 session.status = SessionStatus::Compacting;
                 session.active_tool = None;
             }
-            EventType::SubagentStart | EventType::SubagentStop => {
-                // Informational — recorded in recent_events but no status change
+            EventType::SubagentStart => {
+                // Track the in-flight subagent so a subsequent `Idle` event
+                // doesn't prematurely mark the parent as done. Status itself
+                // is not changed here — the next ToolStart/ToolEnd from the
+                // subagent drives the visible status. If the parent was
+                // already Idle (e.g., the user dispatched a subagent from a
+                // fresh prompt), bump it back to Working so the card
+                // reflects active background work.
+                session.active_subagent_count = session.active_subagent_count.saturating_add(1);
+                if session.status == SessionStatus::Idle {
+                    session.status = SessionStatus::Working;
+                }
+            }
+            EventType::SubagentStop => {
+                session.active_subagent_count = session.active_subagent_count.saturating_sub(1);
+                // If the parent's last `Idle` event was deferred to Working
+                // because subagents were in flight, the card can return to
+                // Idle now that the count has reached zero — but only if no
+                // tool is currently running and no fresh non-subagent event
+                // has nudged the status elsewhere (Thinking, WaitingForInput,
+                // etc., all stay put).
+                if session.active_subagent_count == 0
+                    && session.active_tool.is_none()
+                    && session.status == SessionStatus::Working
+                {
+                    session.status = SessionStatus::Idle;
+                }
             }
             EventType::Error => {
                 session.status = SessionStatus::Error;
@@ -373,6 +418,12 @@ impl AppState {
                 continue;
             }
             if session.active_tool.is_some() {
+                continue;
+            }
+            // Background subagents are legitimate work — don't false-positive
+            // them into Pending. The parent agent simply hasn't fired events
+            // because it's waiting on subagents to finish.
+            if session.active_subagent_count > 0 {
                 continue;
             }
             let elapsed = now.signed_duration_since(session.last_activity);
@@ -1233,6 +1284,151 @@ mod tests {
         let transitioned = state.apply_pending_timeout(chrono::Duration::hours(22));
         assert_eq!(transitioned, vec!["s1".to_string()]);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
+    }
+
+    // -----------------------------------------------------------------------
+    // Subagent-aware status (Working stays Working while subagents are live)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subagent_start_increments_count() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        assert_eq!(state.sessions["s1"].active_subagent_count, 1);
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        assert_eq!(state.sessions["s1"].active_subagent_count, 2);
+    }
+
+    #[test]
+    fn subagent_stop_decrements_count_saturating() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStop, "p1"));
+        // Saturating subtract: count never goes negative.
+        assert_eq!(state.sessions["s1"].active_subagent_count, 0);
+
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStop, "p1"));
+        assert_eq!(state.sessions["s1"].active_subagent_count, 1);
+    }
+
+    #[test]
+    fn subagent_start_from_idle_bumps_status_to_working() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        // Session starts Idle.
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Idle);
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn idle_event_keeps_status_working_while_subagents_in_flight() {
+        // The literal bug the user reported: parent finishes its turn,
+        // fires sessionEnd (=> EventType::Idle), but subagents are still
+        // running. Card must stay Working, not slide to Idle.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        // Parent kicks off a subagent.
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        // Parent runs a tool to dispatch the subagent.
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("dispatch_subagent".into());
+        state.apply_event(tool);
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        // Parent's turn ends (Copilot CLI fires sessionEnd reason=complete).
+        state.apply_event(make_event_with_pane("s1", EventType::Idle, "p1"));
+        assert_eq!(
+            state.sessions["s1"].status,
+            SessionStatus::Working,
+            "Idle event must not flip status while a subagent is still in flight"
+        );
+        assert_eq!(state.sessions["s1"].active_subagent_count, 1);
+    }
+
+    #[test]
+    fn idle_event_flips_to_idle_when_no_subagents_in_flight() {
+        // Regression guard: ordinary Idle behaviour preserved.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("Read".into());
+        state.apply_event(tool);
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::Idle, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn last_subagent_stop_returns_status_to_idle() {
+        // Pattern: parent's turn ended (Working held open by subagent), the
+        // last subagent finishes — card should now go Idle.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::Idle, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStop, "p1"));
+        assert_eq!(state.sessions["s1"].active_subagent_count, 0);
+        assert_eq!(
+            state.sessions["s1"].status,
+            SessionStatus::Idle,
+            "card should return to Idle once the last subagent stops"
+        );
+    }
+
+    #[test]
+    fn subagent_stop_does_not_clobber_active_tool_or_other_statuses() {
+        // If the parent is running its own tool when a subagent finishes,
+        // the parent's status must NOT be forced to Idle.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("ParentTool".into());
+        state.apply_event(tool);
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStop, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert!(state.sessions["s1"].active_tool.is_some());
+
+        // And: if status was Thinking (e.g., user re-prompted) we don't
+        // touch it on a subagent stop.
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        state.sessions.get_mut("s1").unwrap().status = SessionStatus::Thinking;
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStop, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Thinking);
+    }
+
+    #[test]
+    fn pending_timeout_skips_sessions_with_active_subagents() {
+        // Regression: a session that's only "Working" because of background
+        // subagents must not be mis-flipped to Pending after the timeout.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::Idle, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+
+        // Force last_activity into the past so the timeout would otherwise
+        // trigger.
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(60);
+
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(transitioned.is_empty());
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
     }
 
     fn make_event_with_pane(session_id: &str, event_type: EventType, pane_id: &str) -> AgentEvent {

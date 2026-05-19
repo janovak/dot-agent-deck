@@ -6076,6 +6076,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             first_prompts: Vec::new(),
+            active_subagent_count: 0,
             pane_id: None,
         };
 
@@ -6930,6 +6931,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             first_prompts: Vec::new(),
+            active_subagent_count: 0,
             pane_id: None,
         }
     }
@@ -7347,6 +7349,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("third prompt".to_string()),
             first_prompts: Vec::new(),
+            active_subagent_count: 0,
             pane_id: None,
         };
 
@@ -7379,6 +7382,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: Some("old prompt".to_string()),
             first_prompts: Vec::new(),
+            active_subagent_count: 0,
             pane_id: None,
         };
 
@@ -7402,6 +7406,7 @@ mod tests {
             tool_count: 0,
             last_user_prompt: None,
             first_prompts: Vec::new(),
+            active_subagent_count: 0,
             pane_id: None,
         };
 
@@ -8817,6 +8822,7 @@ mod tests {
                     tool_count: 0,
                     last_user_prompt: None,
                     first_prompts: Vec::new(),
+                    active_subagent_count: 0,
                     pane_id: Some(orchestrator_pane.clone()),
                 },
             );
@@ -8889,6 +8895,7 @@ mod tests {
                     tool_count: 0,
                     last_user_prompt: None,
                     first_prompts: Vec::new(),
+                    active_subagent_count: 0,
                     pane_id: Some(orchestrator_pane.clone()),
                 },
             );

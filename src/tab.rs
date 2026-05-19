@@ -769,6 +769,7 @@ mod tests {
                 tool_count: 1,
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
+                active_subagent_count: 0,
                 pane_id: None,
             },
         )
@@ -830,6 +831,7 @@ mod tests {
                 tool_count: 0,
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
+                active_subagent_count: 0,
                 pane_id: None,
             },
         );
