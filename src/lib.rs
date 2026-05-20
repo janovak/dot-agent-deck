@@ -1,4 +1,5 @@
 pub mod ascii_art;
+pub mod bookmark;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;

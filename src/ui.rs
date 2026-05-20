@@ -117,6 +117,12 @@ enum UiMode {
     StarPrompt,
     ConfigGenPrompt,
     QuitConfirm,
+    /// Editing or creating a bookmark for a session — modal text input
+    /// prefilled with any existing note for the target session.
+    BookmarkNote,
+    /// Browsing the bookmark list — modal picker with navigation, open
+    /// (Enter), delete (d), and dismiss (Esc).
+    BookmarkPicker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +534,24 @@ struct UiState {
     /// and writes only when the snapshot differs from this value, so
     /// steady-state runs (no pane open/close/rename) do no disk I/O.
     last_saved_session: Option<config::SavedSession>,
+    /// Cached list of bookmarked Copilot CLI sessions. Reloaded from disk
+    /// after any mutation (add/update/delete). Kept in memory so the
+    /// card-render bookmark indicator and the picker UI can read it
+    /// without a fresh file read every frame.
+    bookmarks: Vec<crate::bookmark::Bookmark>,
+    /// Highlighted index in the bookmark picker (UiMode::BookmarkPicker).
+    bookmark_picker_index: usize,
+    /// In-flight text being typed in the bookmark-note modal.
+    bookmark_note_input: String,
+    /// Target of the bookmark-note modal: which session we're editing/creating
+    /// a bookmark for, and the session's display name (cached at modal open).
+    bookmark_note_target: Option<BookmarkNoteTarget>,
+}
+
+#[derive(Debug, Clone)]
+struct BookmarkNoteTarget {
+    session_id: String,
+    session_name: String,
 }
 
 /// Tracks an in-progress or completed mouse text selection within a pane.
@@ -585,6 +609,10 @@ impl UiState {
             pending_dispatches: Vec::new(),
             workspace: None,
             last_saved_session: None,
+            bookmarks: Vec::new(),
+            bookmark_picker_index: 0,
+            bookmark_note_input: String::new(),
+            bookmark_note_target: None,
         }
     }
 }
@@ -1898,6 +1926,197 @@ fn handle_rename_key(
     KeyResult::Continue
 }
 
+/// Open the bookmark-note modal targeting the currently selected card.
+/// Reads the session ID from the selected card, looks up the session name
+/// (Copilot DB for CopilotCli; first prompt or "(unnamed)" otherwise), and
+/// prefills `ui.bookmark_note_input` with any existing bookmark's note so
+/// editing is one-step.
+fn open_bookmark_note_modal(
+    ui: &mut UiState,
+    snapshot: &AppState,
+    filtered: &[(&String, &SessionState)],
+) {
+    let Some((sid, session)) = filtered.get(ui.selected_index).map(|(s, ss)| (*s, *ss)) else {
+        ui.status_message = Some((
+            "No session selected to bookmark".to_string(),
+            std::time::Instant::now(),
+        ));
+        return;
+    };
+
+    // Use the *Copilot* session id (or any agent's session id) — not the
+    // dot-agent-deck session key. SessionState.session_id is what we want.
+    let session_id = session.session_id.clone();
+    if session_id.is_empty() {
+        ui.status_message = Some((
+            "Session has no ID yet (agent may not have started)".to_string(),
+            std::time::Instant::now(),
+        ));
+        return;
+    }
+
+    // Look up the human-readable name. Try Copilot's DB first when relevant;
+    // otherwise fall back to the first prompt we've seen in the conversation.
+    let session_name = if session.agent_type == AgentType::CopilotCli {
+        crate::bookmark::lookup_copilot_session_name(&session_id)
+            .or_else(|| session.first_prompts.first().cloned())
+            .unwrap_or_else(|| "(unnamed)".to_string())
+    } else {
+        session.first_prompts.first().cloned().unwrap_or_else(|| {
+            ui.display_names
+                .get(sid)
+                .cloned()
+                .unwrap_or_else(|| "(unnamed)".to_string())
+        })
+    };
+
+    // Prefill with the existing note if this session is already bookmarked.
+    ui.bookmarks = crate::bookmark::load();
+    let existing = ui.bookmarks.iter().find(|b| b.session_id == session_id);
+    ui.bookmark_note_input = existing.map(|b| b.note.clone()).unwrap_or_default();
+    ui.bookmark_note_target = Some(BookmarkNoteTarget {
+        session_id,
+        session_name,
+    });
+    ui.mode = UiMode::BookmarkNote;
+
+    // Quiet the snapshot-unused-on-non-copilot warning while keeping the
+    // dependency explicit in case future callers want global state.
+    let _ = snapshot;
+}
+
+/// Modal key handler for the bookmark-note editor.
+fn handle_bookmark_note_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
+        ui.mode = UiMode::QuitConfirm;
+        return KeyResult::Continue;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            ui.bookmark_note_input.clear();
+            ui.bookmark_note_target = None;
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Enter => {
+            if let Some(target) = ui.bookmark_note_target.take() {
+                let bookmark = crate::bookmark::Bookmark {
+                    session_id: target.session_id.clone(),
+                    session_name: target.session_name,
+                    note: ui.bookmark_note_input.clone(),
+                    updated_at: Utc::now(),
+                };
+                let action_word = match crate::bookmark::upsert(bookmark) {
+                    Ok(true) => "Updated bookmark",
+                    Ok(false) => "Added bookmark",
+                    Err(e) => {
+                        ui.status_message = Some((
+                            format!("Bookmark save failed: {e}"),
+                            std::time::Instant::now(),
+                        ));
+                        ui.bookmark_note_input.clear();
+                        ui.mode = UiMode::Normal;
+                        return KeyResult::Continue;
+                    }
+                };
+                ui.bookmarks = crate::bookmark::load();
+                ui.status_message = Some((
+                    format!(
+                        "{action_word} for {}",
+                        &target.session_id[..8.min(target.session_id.len())]
+                    ),
+                    std::time::Instant::now(),
+                ));
+            }
+            ui.bookmark_note_input.clear();
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Backspace => {
+            ui.bookmark_note_input.pop();
+        }
+        KeyCode::Char(c) => {
+            ui.bookmark_note_input.push(c);
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
+/// Modal key handler for the bookmark picker.
+fn handle_bookmark_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        ui.quit_confirm_selected = 0;
+        ui.mode = UiMode::QuitConfirm;
+        return KeyResult::Continue;
+    }
+    let total = ui.bookmarks.len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            ui.mode = UiMode::Normal;
+        }
+        KeyCode::Down | KeyCode::Char('j') if total > 0 => {
+            ui.bookmark_picker_index = (ui.bookmark_picker_index + 1) % total;
+        }
+        KeyCode::Up | KeyCode::Char('k') if total > 0 => {
+            ui.bookmark_picker_index = (ui.bookmark_picker_index + total - 1) % total;
+        }
+        KeyCode::Char('d') => {
+            // Delete the highlighted bookmark.
+            if let Some(b) = ui.bookmarks.get(ui.bookmark_picker_index).cloned() {
+                let _ = crate::bookmark::delete(&b.session_id);
+                ui.bookmarks = crate::bookmark::load();
+                if ui.bookmark_picker_index >= ui.bookmarks.len() && !ui.bookmarks.is_empty() {
+                    ui.bookmark_picker_index = ui.bookmarks.len() - 1;
+                }
+                if ui.bookmarks.is_empty() {
+                    ui.mode = UiMode::Normal;
+                }
+                ui.status_message = Some((
+                    format!(
+                        "Deleted bookmark {}",
+                        &b.session_id[..8.min(b.session_id.len())]
+                    ),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
+        KeyCode::Enter => {
+            // Open the bookmark as a new pane via NewPaneRequest. We let the
+            // existing new-pane dispatch path do the heavy lifting: spawn a
+            // pane with `copilot --resume <guid>` in the session's original
+            // cwd (looked up from Copilot's DB; falls back to the user's
+            // home directory if the cwd isn't available).
+            if let Some(b) = ui.bookmarks.get(ui.bookmark_picker_index).cloned() {
+                let info = crate::bookmark::lookup_copilot_session(&b.session_id);
+                let cwd = info
+                    .as_ref()
+                    .and_then(|i| i.cwd.clone())
+                    .filter(|p| std::path::Path::new(p).is_dir())
+                    .unwrap_or_else(|| {
+                        std::env::var("USERPROFILE")
+                            .or_else(|_| std::env::var("HOME"))
+                            .unwrap_or_else(|_| ".".to_string())
+                    });
+                let name = if b.note.is_empty() {
+                    b.session_name.clone()
+                } else {
+                    b.note.clone()
+                };
+                ui.mode = UiMode::Normal;
+                return KeyResult::NewPane(NewPaneRequest {
+                    dir: PathBuf::from(cwd),
+                    name,
+                    command: format!("copilot --resume {}", b.session_id),
+                    mode_config: None,
+                    orchestration_config: None,
+                });
+            }
+        }
+        _ => {}
+    }
+    KeyResult::Continue
+}
+
 fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
@@ -2134,6 +2353,7 @@ pub fn run_tui(
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, palette);
     ui.workspace = workspace.clone();
+    ui.bookmarks = crate::bookmark::load();
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -3361,6 +3581,23 @@ pub fn run_tui(
                         }
                         shortcut_handled = true;
                     }
+                    // Ctrl+B: bookmark the currently selected card's session
+                    // (opens a note input modal). Ctrl+Shift+B: open the
+                    // bookmark picker. On most terminals + crossterm,
+                    // Ctrl+Shift+letter delivers the uppercase char with
+                    // both CONTROL and SHIFT modifiers set.
+                    KeyCode::Char(c) if c.eq_ignore_ascii_case(&'b') => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) || c.is_ascii_uppercase() {
+                            // Ctrl+Shift+B → picker.
+                            ui.bookmarks = crate::bookmark::load();
+                            ui.bookmark_picker_index = 0;
+                            ui.mode = UiMode::BookmarkPicker;
+                        } else {
+                            // Ctrl+B → add/update bookmark for selected card.
+                            open_bookmark_note_modal(&mut ui, &snapshot, &filtered);
+                        }
+                        shortcut_handled = true;
+                    }
                     _ => {}
                 }
             }
@@ -3513,6 +3750,8 @@ pub fn run_tui(
                     UiMode::StarPrompt => handle_star_prompt_key(key, &mut ui),
                     UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, &mut ui),
                     UiMode::QuitConfirm => handle_quit_confirm_key(key, &mut ui),
+                    UiMode::BookmarkNote => handle_bookmark_note_key(key, &mut ui),
+                    UiMode::BookmarkPicker => handle_bookmark_picker_key(key, &mut ui),
                 }
             };
 
@@ -4355,6 +4594,7 @@ fn render_frame(
                 if n <= 9 { Some(n as u8) } else { None }
             };
             let idle_art = ids.get(col_idx).and_then(|id| ui.idle_art_cache.get(*id));
+            let is_bookmarked = crate::bookmark::is_bookmarked(&ui.bookmarks, &session.session_id);
             // Track card rect for click-to-focus.
             ui.card_rects.push((flat_index, col_chunks[col_idx]));
             render_session_card(
@@ -4368,6 +4608,7 @@ fn render_frame(
                 density,
                 palette,
                 idle_art,
+                is_bookmarked,
             );
         }
     }
@@ -4430,6 +4671,9 @@ fn render_overlays(
     }
     if ui.mode == UiMode::QuitConfirm {
         render_quit_confirm(frame, ui.quit_confirm_selected, palette);
+    }
+    if ui.mode == UiMode::BookmarkPicker {
+        render_bookmark_picker(frame, ui, palette);
     }
 }
 
@@ -4794,6 +5038,33 @@ fn render_bottom_bar(
             let cursor_x = area.x + 8 + ui.rename_text.len() as u16;
             frame.set_cursor_position(Position::new(cursor_x, area.y));
         }
+        UiMode::BookmarkNote => {
+            let target_name = ui
+                .bookmark_note_target
+                .as_ref()
+                .map(|t| t.session_name.as_str())
+                .unwrap_or("(unknown)");
+            // Truncate the displayed session name so the input stays visible.
+            let display_name: String = if target_name.chars().count() > 30 {
+                target_name.chars().take(27).collect::<String>() + "…"
+            } else {
+                target_name.to_string()
+            };
+            let prompt = format!("Bookmark \"{display_name}\" — note: ");
+            let prompt_len = prompt.chars().count() as u16;
+            let line = Line::from(vec![
+                Span::styled(
+                    prompt,
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&ui.bookmark_note_input),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            let cursor_x = area.x + prompt_len + ui.bookmark_note_input.chars().count() as u16;
+            frame.set_cursor_position(Position::new(cursor_x, area.y));
+        }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
                 let line = Line::styled(msg.as_str(), Style::default().fg(Color::Yellow));
@@ -4898,6 +5169,121 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize, palette: ColorPalette
         .style(Style::default().bg(palette.terminal_bg));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+}
+
+fn render_bookmark_picker(frame: &mut Frame, ui: &UiState, palette: ColorPalette) {
+    let area = frame.area();
+    let popup_width = 88u16.min(area.width.saturating_sub(4));
+    // Allow up to area_height - 4 rows for the popup, with at least 7.
+    let header_lines = 3u16; // blank, hint, blank
+    let footer_lines = 3u16; // blank, key-hints, blank
+    let entry_lines = ui.bookmarks.len() as u16;
+    let desired_inner = header_lines + footer_lines + entry_lines.max(1);
+    let popup_height = (desired_inner + 2)
+        .min(area.height.saturating_sub(4))
+        .max(8);
+    let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    // Clear the underlying cells so the modal doesn't blend with whatever's
+    // drawn behind it.
+    frame.render_widget(Clear, popup_area);
+
+    let mut text = vec![Line::from("")];
+    if ui.bookmarks.is_empty() {
+        text.push(Line::styled(
+            "  No bookmarks yet.",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        text.push(Line::from(""));
+        text.push(Line::styled(
+            "  Press Ctrl+B on a session card to add one.",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        text.push(Line::styled(
+            "  Pick a bookmarked session to resume:",
+            Style::default().fg(palette.text_secondary),
+        ));
+        text.push(Line::from(""));
+
+        // Reserve roughly half the inner width for the session name, then
+        // note, then a short GUID + date suffix.
+        let inner_w = popup_width.saturating_sub(4) as usize;
+        let name_w = inner_w * 4 / 10;
+        let note_w = inner_w * 3 / 10;
+
+        for (i, b) in ui.bookmarks.iter().enumerate() {
+            let selected = i == ui.bookmark_picker_index;
+            let cursor = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.text_secondary)
+            };
+            let name = truncate_for_picker(&b.session_name, name_w);
+            let note = if b.note.is_empty() {
+                "(no note)".to_string()
+            } else {
+                truncate_for_picker(&b.note, note_w)
+            };
+            let id_short: String = b.session_id.chars().take(8).collect();
+            let when = b.updated_at.format("%Y-%m-%d");
+            let row = format!(
+                "{cursor}{name:<name_w$}  {note:<note_w$}  {id_short}  {when}",
+                name = name,
+                name_w = name_w,
+                note = note,
+                note_w = note_w,
+            );
+            text.push(Line::styled(row, style));
+        }
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "  ↑/↓ or j/k: navigate    Enter: open    d: delete    Esc/q: cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let block = Block::default()
+        .title(" Bookmarks ")
+        .title_style(
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .style(Style::default().bg(palette.terminal_bg));
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// Truncate a string to fit within `max_chars` columns, appending `…` when
+/// truncated. Used by the bookmark picker to keep the table aligned.
+fn truncate_for_picker(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else if max_chars == 0 {
+        String::new()
+    } else {
+        let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn render_star_prompt(frame: &mut Frame, palette: ColorPalette) {
@@ -5442,6 +5828,7 @@ fn render_session_card(
     density: CardDensity,
     palette: ColorPalette,
     idle_art: Option<&IdleArtEntry>,
+    is_bookmarked: bool,
 ) {
     let is_placeholder = session.agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
@@ -5462,11 +5849,12 @@ fn render_session_card(
         None => String::new(),
     };
     let sel_prefix = if is_selected { "▸ " } else { "" };
+    let bookmark_prefix = if is_bookmarked { "★ " } else { "" };
     let mut title_left = if let Some(name) = display_name {
-        format!(" {sel_prefix}{num_prefix}{} ", name)
+        format!(" {sel_prefix}{num_prefix}{bookmark_prefix}{} ", name)
     } else {
         format!(
-            " {sel_prefix}{num_prefix}{} · {} ",
+            " {sel_prefix}{num_prefix}{bookmark_prefix}{} · {} ",
             session.agent_type, id_display
         )
     };

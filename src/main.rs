@@ -124,6 +124,11 @@ enum Commands {
         #[command(subcommand)]
         action: WorkspacesAction,
     },
+    /// Manage bookmarked Copilot CLI sessions
+    Bookmarks {
+        #[command(subcommand)]
+        action: BookmarksAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -134,6 +139,18 @@ enum WorkspacesAction {
     Delete {
         /// Workspace name
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BookmarksAction {
+    /// List all bookmarked sessions
+    List,
+    /// Delete one or more bookmarks. Argument matches against the session ID
+    /// (prefix, >=4 chars) or an exact note string.
+    Delete {
+        /// Session ID prefix (>=4 chars) or exact note text
+        query: String,
     },
 }
 
@@ -419,6 +436,47 @@ fn main() -> ExitCode {
                     }
                 }
             }
+        },
+        Some(Commands::Bookmarks { action }) => match action {
+            BookmarksAction::List => {
+                let bookmarks = dot_agent_deck::bookmark::load();
+                if bookmarks.is_empty() {
+                    println!(
+                        "(no bookmarks yet — bookmark the focused card's session with Ctrl+B inside the dashboard)"
+                    );
+                } else {
+                    for b in &bookmarks {
+                        let id_short: String = b.session_id.chars().take(8).collect();
+                        let when = b.updated_at.format("%Y-%m-%d");
+                        let name = if b.session_name.is_empty() {
+                            "(unnamed)"
+                        } else {
+                            b.session_name.as_str()
+                        };
+                        let note = if b.note.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  — {}", b.note)
+                        };
+                        println!("{id_short}  {when}  {name}{note}");
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            BookmarksAction::Delete { query } => match dot_agent_deck::bookmark::delete(&query) {
+                Ok(0) => {
+                    eprintln!("No bookmark matched '{query}'");
+                    ExitCode::FAILURE
+                }
+                Ok(n) => {
+                    println!("Deleted {n} bookmark{}", if n == 1 { "" } else { "s" });
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            },
         },
     }
 }
