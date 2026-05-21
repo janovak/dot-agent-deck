@@ -151,11 +151,47 @@ impl EmbeddedPaneController {
     }
 
     /// Resize a pane's PTY and VT100 parser to the given dimensions.
+    ///
+    /// On Windows, when the requested size differs from the current vt100 size,
+    /// the master PTY is resized twice: first to a 1-row jiggle, then to the
+    /// target. ConPTY does not always reliably deliver a size change to the
+    /// child process — without the jiggle the agent can keep drawing at its
+    /// previous size, causing rows to drift into vt100's scrollback (visible
+    /// as a stacked prompt / status line). The jiggle forces ConPTY to
+    /// re-signal the child.
     pub fn resize_pane_pty(&self, pane_id: &str, rows: u16, cols: u16) -> Result<(), PaneError> {
         let panes = self.panes.lock().unwrap();
         let pane = panes
             .get(pane_id)
             .ok_or_else(|| PaneError::CommandFailed(format!("Pane {pane_id} not found")))?;
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+
+        // Determine whether the size is actually changing. If it isn't, we
+        // skip both the jiggle and the PTY resize call to avoid unnecessary
+        // redraw churn on every focus change / tab switch.
+        let size_changed = match pane.screen.lock() {
+            Ok(parser) => parser.screen().size() != (rows, cols),
+            Err(_) => true,
+        };
+
+        if !size_changed {
+            return Ok(());
+        }
+
+        #[cfg(windows)]
+        {
+            // Pick a jiggle row that is guaranteed to differ from the target.
+            let jiggle_rows = if rows > 1 { rows - 1 } else { rows + 1 };
+            let _ = pane.master.resize(PtySize {
+                rows: jiggle_rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+
         pane.master
             .resize(PtySize {
                 rows,
@@ -193,6 +229,162 @@ impl EmbeddedPaneController {
         let button = if up { 64 } else { 65 };
         let seq = format!("\x1b[<{};{};{}M", button, col + 1, row + 1);
         self.write_raw_bytes(pane_id, seq.as_bytes())
+    }
+
+    /// Create a new pane with explicit initial PTY and vt100 dimensions.
+    ///
+    /// Matching the actual rendered dimensions at spawn-time avoids the
+    /// startup race where the agent emits its first redraw against a 24×80
+    /// grid (the prior default), only for vt100 to shrink to the real layout
+    /// size moments later. With the default 24×80 path that race lets early
+    /// output (banners, prompts, status lines) accumulate in scrollback and
+    /// reappear as stacked duplicates as the agent re-renders.
+    pub fn create_pane_with_size(
+        &self,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<String, PaneError> {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+
+        let pty_system = NativePtySystem::default();
+
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| PaneError::CommandFailed(format!("Failed to open PTY: {e}")))?;
+
+        let default_shell = default_shell();
+
+        let mut cmd = match command {
+            Some(c) if c.contains(' ') => {
+                let mut cmd = CommandBuilder::new(&default_shell);
+                cmd.arg(shell_command_flag());
+                cmd.arg(c);
+                cmd
+            }
+            Some(c) => CommandBuilder::new(c),
+            None => CommandBuilder::new(&default_shell),
+        };
+
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
+
+        let pane_id = self.allocate_id();
+        // Tag the spawned process so hooks can identify which pane it belongs to.
+        cmd.env("DOT_AGENT_DECK_PANE_ID", &pane_id);
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| PaneError::CommandFailed(format!("Failed to spawn command: {e}")))?;
+
+        // Drop the slave — we interact through the master side only.
+        drop(pair.slave);
+
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| PaneError::CommandFailed(format!("Failed to get PTY writer: {e}")))?;
+
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| PaneError::CommandFailed(format!("Failed to get PTY reader: {e}")))?;
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
+        let mouse_mode = Arc::new(AtomicBool::new(false));
+        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
+
+        // Spawn a background thread to read PTY output and feed it to the vt100 parser.
+        // Strips OSC 8 hyperlink sequences and records row → URL associations.
+        let parser_clone = Arc::clone(&parser);
+        let mouse_mode_clone = Arc::clone(&mouse_mode);
+        let hyperlinks_clone = Arc::clone(&hyperlinks);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut osc8 = Osc8Filter::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        scan_mouse_mode(data, &mouse_mode_clone);
+
+                        let segments = osc8.process(data);
+                        let mut new_links: Vec<(u16, String)> = Vec::new();
+                        let mut scroll_amount: u16 = 0;
+
+                        if let Ok(mut p) = parser_clone.lock() {
+                            let max_row = p.screen().size().0.saturating_sub(1);
+                            for segment in &segments {
+                                match segment {
+                                    Osc8Segment::Text(bytes) => {
+                                        let rb = p.screen().cursor_position().0;
+                                        p.process(bytes);
+                                        let ra = p.screen().cursor_position().0;
+                                        if rb >= max_row && ra >= max_row {
+                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
+                                                as u16;
+                                            scroll_amount += nl;
+                                        }
+                                    }
+                                    Osc8Segment::LinkedText { url, bytes } => {
+                                        // cursor_before is the row where link text starts
+                                        let row = p.screen().cursor_position().0;
+                                        let rb = row;
+                                        p.process(bytes);
+                                        let ra = p.screen().cursor_position().0;
+                                        new_links.push((row, url.clone()));
+                                        if rb >= max_row && ra >= max_row {
+                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
+                                                as u16;
+                                            scroll_amount += nl;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // parser lock released
+
+                        if (!new_links.is_empty() || scroll_amount > 0)
+                            && let Ok(mut hmap) = hyperlinks_clone.lock()
+                        {
+                            if scroll_amount > 0 {
+                                hmap.shift_up(scroll_amount);
+                            }
+                            for (row, url) in &new_links {
+                                hmap.set_row(*row, url);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let pane = Pane {
+            writer,
+            screen: parser,
+            child,
+            master: pair.master,
+            name: command.unwrap_or("shell").to_string(),
+            is_focused: false,
+            command: command.map(|c| c.to_string()),
+            mouse_mode,
+            hyperlinks,
+        };
+
+        self.panes.lock().unwrap().insert(pane_id.clone(), pane);
+
+        Ok(pane_id)
     }
 
     fn allocate_id(&self) -> String {
@@ -287,142 +479,13 @@ impl PaneController for EmbeddedPaneController {
     }
 
     fn create_pane(&self, command: Option<&str>, cwd: Option<&str>) -> Result<String, PaneError> {
-        let pty_system = NativePtySystem::default();
-
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to open PTY: {e}")))?;
-
-        let default_shell = default_shell();
-
-        let mut cmd = match command {
-            Some(c) if c.contains(' ') => {
-                let mut cmd = CommandBuilder::new(&default_shell);
-                cmd.arg(shell_command_flag());
-                cmd.arg(c);
-                cmd
-            }
-            Some(c) => CommandBuilder::new(c),
-            None => CommandBuilder::new(&default_shell),
-        };
-
-        if let Some(dir) = cwd {
-            cmd.cwd(dir);
-        }
-
-        let pane_id = self.allocate_id();
-        // Tag the spawned process so hooks can identify which pane it belongs to.
-        cmd.env("DOT_AGENT_DECK_PANE_ID", &pane_id);
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to spawn command: {e}")))?;
-
-        // Drop the slave — we interact through the master side only.
-        drop(pair.slave);
-
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to get PTY writer: {e}")))?;
-
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| PaneError::CommandFailed(format!("Failed to get PTY reader: {e}")))?;
-
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 10_000)));
-        let mouse_mode = Arc::new(AtomicBool::new(false));
-        let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
-
-        // Spawn a background thread to read PTY output and feed it to the vt100 parser.
-        // Strips OSC 8 hyperlink sequences and records row → URL associations.
-        let parser_clone = Arc::clone(&parser);
-        let mouse_mode_clone = Arc::clone(&mouse_mode);
-        let hyperlinks_clone = Arc::clone(&hyperlinks);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let mut osc8 = Osc8Filter::new();
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = &buf[..n];
-                        scan_mouse_mode(data, &mouse_mode_clone);
-
-                        let segments = osc8.process(data);
-                        let mut new_links: Vec<(u16, String)> = Vec::new();
-                        let mut scroll_amount: u16 = 0;
-
-                        if let Ok(mut p) = parser_clone.lock() {
-                            let max_row = p.screen().size().0.saturating_sub(1);
-                            for segment in &segments {
-                                match segment {
-                                    Osc8Segment::Text(bytes) => {
-                                        let rb = p.screen().cursor_position().0;
-                                        p.process(bytes);
-                                        let ra = p.screen().cursor_position().0;
-                                        if rb >= max_row && ra >= max_row {
-                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
-                                                as u16;
-                                            scroll_amount += nl;
-                                        }
-                                    }
-                                    Osc8Segment::LinkedText { url, bytes } => {
-                                        // cursor_before is the row where link text starts
-                                        let row = p.screen().cursor_position().0;
-                                        let rb = row;
-                                        p.process(bytes);
-                                        let ra = p.screen().cursor_position().0;
-                                        new_links.push((row, url.clone()));
-                                        if rb >= max_row && ra >= max_row {
-                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
-                                                as u16;
-                                            scroll_amount += nl;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // parser lock released
-
-                        if (!new_links.is_empty() || scroll_amount > 0)
-                            && let Ok(mut hmap) = hyperlinks_clone.lock()
-                        {
-                            if scroll_amount > 0 {
-                                hmap.shift_up(scroll_amount);
-                            }
-                            for (row, url) in &new_links {
-                                hmap.set_row(*row, url);
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let pane = Pane {
-            writer,
-            screen: parser,
-            child,
-            master: pair.master,
-            name: command.unwrap_or("shell").to_string(),
-            is_focused: false,
-            command: command.map(|c| c.to_string()),
-            mouse_mode,
-            hyperlinks,
-        };
-
-        self.panes.lock().unwrap().insert(pane_id.clone(), pane);
-
-        Ok(pane_id)
+        // Default dimensions are a fallback for callers that don't know the
+        // target layout yet (tests, mocks, restore paths). UI call sites that
+        // know the layout should call `create_pane_with_size` directly so the
+        // child process spawns at the correct dimensions — otherwise the
+        // agent's early output is rendered against a 24×80 vt100 grid and
+        // rows can drift into scrollback before the post-spawn resize lands.
+        self.create_pane_with_size(command, cwd, 24, 80)
     }
 
     fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
@@ -768,6 +831,85 @@ mod tests {
         assert_eq!(panes[0].title, "shell");
         assert!(panes[0].command.is_none());
 
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn create_pane_with_size_initializes_vt100_at_target() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane_with_size(None, None, 40, 120).unwrap();
+        let screen = ctrl.get_screen(&id).unwrap();
+        let size = screen.lock().unwrap().screen().size();
+        assert_eq!(
+            size,
+            (40, 120),
+            "vt100 must spawn at requested dimensions to avoid startup scrollback drift"
+        );
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn create_pane_with_size_does_not_panic_on_zero_dims() {
+        let ctrl = EmbeddedPaneController::new();
+        // Should either succeed (with clamped dims) or return an error — but
+        // must not panic. We don't assert on the exact dim because OS PTYs
+        // may refuse very small sizes.
+        let result = ctrl.create_pane_with_size(None, None, 0, 0);
+        if let Ok(id) = result {
+            let _ = ctrl.close_pane(&id);
+        }
+    }
+
+    #[test]
+    fn resize_pane_pty_updates_vt100_size() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(None, None).unwrap();
+        ctrl.resize_pane_pty(&id, 30, 100).unwrap();
+        let screen = ctrl.get_screen(&id).unwrap();
+        assert_eq!(screen.lock().unwrap().screen().size(), (30, 100));
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn resize_pane_pty_is_noop_when_size_unchanged() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane_with_size(None, None, 20, 60).unwrap();
+        // No-op resize — should still succeed and keep size.
+        ctrl.resize_pane_pty(&id, 20, 60).unwrap();
+        let screen = ctrl.get_screen(&id).unwrap();
+        assert_eq!(screen.lock().unwrap().screen().size(), (20, 60));
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn resize_pane_pty_zero_dim_is_safe_noop_on_known_pane() {
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane(None, None).unwrap();
+        // 0 dims should not mutate vt100 and should not error for a known pane.
+        ctrl.resize_pane_pty(&id, 0, 80).unwrap();
+        ctrl.resize_pane_pty(&id, 24, 0).unwrap();
+        let screen = ctrl.get_screen(&id).unwrap();
+        assert_eq!(screen.lock().unwrap().screen().size(), (24, 80));
+        ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn resize_pane_pty_unknown_pane_errors() {
+        let ctrl = EmbeddedPaneController::new();
+        assert!(ctrl.resize_pane_pty("999", 30, 80).is_err());
+    }
+
+    #[test]
+    fn resize_pane_pty_handles_repeated_size_changes() {
+        // Exercises the Windows jiggle path: every change is a real change, so
+        // the jiggle fires each time. Should land at the final target.
+        let ctrl = EmbeddedPaneController::new();
+        let id = ctrl.create_pane_with_size(None, None, 20, 60).unwrap();
+        ctrl.resize_pane_pty(&id, 30, 80).unwrap();
+        ctrl.resize_pane_pty(&id, 25, 70).unwrap();
+        ctrl.resize_pane_pty(&id, 40, 100).unwrap();
+        let screen = ctrl.get_screen(&id).unwrap();
+        assert_eq!(screen.lock().unwrap().screen().size(), (40, 100));
         ctrl.close_pane(&id).unwrap();
     }
 }

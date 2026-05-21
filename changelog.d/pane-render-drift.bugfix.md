@@ -1,0 +1,7 @@
+- **Fixed Stacked Duplicate Prompts / Status Lines in Pane Output**
+  Some panes intermittently showed the agent's prompt (`❯`) and status hint stamped multiple times stacked — usually after a layout change, focus shift, or restore. The root cause was a size mismatch between the PTY+vt100 emulator and the rendered chunk: the PTY was always opened at 24×80 and only resized *after* the child process started emitting output, so the agent's first redraw landed in a wrongly-sized grid and rows leaked into vt100's 10,000-row scrollback. Subsequent redraws then re-stamped the prompt/status above the live one, accumulating duplicates. Three fixes:
+  - Panes now spawn with their PTY *and* vt100 parser already sized to the chunk they're about to occupy. No more 24×80 race window. Applies to both interactive new panes (`Ctrl+n` from the dashboard) and workspace/continue restore.
+  - The right-panel width math in the resize helper now goes through ratatui's `Layout` solver instead of an ad-hoc `width * 67 / 100` — guaranteeing vt100's column count exactly matches the rendered widget.
+  - On Windows, `resize_pane_pty` does a 1-row jiggle (resize to `rows ± 1`, then to `rows`) when the size actually changes, working around ConPTY not always reliably delivering resize signals to the child process.
+
+  Adding a new dashboard pane also now refreshes every other dashboard pane's size, so Tiled re-divides cleanly and Stacked collapses the previously-focused pane to its 1-row title strip.
