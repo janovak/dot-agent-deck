@@ -1659,6 +1659,48 @@ fn strip_paste_trailing_newlines_bytes(bytes: &[u8]) -> &[u8] {
     &bytes[..end]
 }
 
+/// Decide whether a freshly-arrived `Event::Paste` payload is a *chunk
+/// duplicate* of the immediately preceding one — i.e., another part of
+/// the same logical Ctrl+V whose content was already appended to the
+/// burst on the first chunk.
+///
+/// Some terminals (Windows Terminal in particular) split a single Ctrl+V
+/// of large or table-style content into multiple bracketed-paste
+/// sequences and deliver them as separate `Event::Paste` events,
+/// sometimes with a tiny scheduling gap between them so the event drain
+/// breaks in-between. To rebuild the original logical paste, the
+/// `Event::Paste` handler reads the *full* clipboard via arboard on the
+/// first chunk and appends it to the burst; subsequent chunks must be
+/// skipped — but only when they really are chunks of the same paste,
+/// not when the user is intentionally pasting again.
+///
+/// "Chunk" here means: same clipboard content as the previous chunk,
+/// arriving within `window` of it. The caller resets `prev` to `None`
+/// whenever a non-Paste event is processed, so the dedup never bridges
+/// a user action.
+fn paste_event_is_chunk_dup(
+    prev: Option<&(Vec<u8>, std::time::Instant)>,
+    content: &[u8],
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> bool {
+    match prev {
+        Some((prev_bytes, prev_time)) => {
+            prev_bytes.as_slice() == content && now.duration_since(*prev_time) < window
+        }
+        None => false,
+    }
+}
+
+/// Maximum gap between consecutive `Event::Paste` events that we still
+/// treat as parts of the same logical Ctrl+V. Sized generously so even
+/// slow render frames between chunks (heavy dashboard, big terminal,
+/// background activity) don't push the second chunk outside the window
+/// and cause a double-append. The cost is that two *intentional*
+/// pastes of identical content within this window are deduped to one —
+/// a vanishingly rare workflow.
+const PASTE_CHUNK_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Flush a buffered burst of PaneInput keystrokes to the focused pane.
 ///
 /// A burst is built up when several printable Char / Enter events arrive
@@ -2892,6 +2934,13 @@ pub fn run_tui(
         ui.last_saved_session = Some(seeded);
     }
 
+    // Chunk-dedup state for `Event::Paste`. Persisted across drain
+    // iterations because Windows Terminal can split one Ctrl+V into
+    // multiple paste events with the event drain breaking between
+    // them. Reset on any non-Paste event so the dedup never bridges
+    // a user action.
+    let mut paste_dedup: Option<(Vec<u8>, std::time::Instant)> = None;
+
     'outer: loop {
         // Expire stale status messages
         if let Some((_, created)) = &ui.status_message
@@ -3205,6 +3254,13 @@ pub fn run_tui(
         // Process events in a tight loop until the queue is empty.
         loop {
             let ev = event::read()?;
+
+            // Reset paste-chunk dedup before any non-Paste handling so a
+            // logical Ctrl+V's chunks can be coalesced but unrelated user
+            // input never bridges the window.
+            if !matches!(ev, Event::Paste(_)) {
+                paste_dedup = None;
+            }
 
             // Handle terminal resize: update PTY dimensions for all embedded panes.
             if let Event::Resize(_w, _h) = ev {
@@ -3674,14 +3730,51 @@ pub fn run_tui(
             // the single source of truth for paste payload assembly: trailing
             // CR/LF strip, bracketed-paste wrap decision, status-message
             // diagnostic, and PTY write.
+            //
+            // We read the *full clipboard* via arboard rather than trusting
+            // crossterm's `text` field, because some terminals (Windows
+            // Terminal with rich content like Teams messages that contain
+            // tables) split a single Ctrl+V into multiple `Event::Paste`
+            // events. Each chunk would otherwise be wrapped in its own
+            // bracketed-paste markers and any chunk ending in CR would
+            // auto-submit at the agent — producing the "partial paste,
+            // Enter, more paste" symptom. Reading the clipboard once,
+            // combined with the dedup below, rebuilds the original logical
+            // paste even when the event drain breaks between chunks. This
+            // mirrors the right-click paste path (which has always read
+            // arboard) and is why right-click never exhibits the bug.
             if let Event::Paste(text) = ev {
                 if ui.mode == UiMode::PaneInput {
-                    pane_input_burst.extend_from_slice(text.as_bytes());
-                    // Use `2` as the burst-key count even for a single-byte
-                    // paste so the flush always takes the paste branch
-                    // (strip trailing newlines + wrap) rather than the
-                    // single-keystroke pass-through branch.
-                    pane_input_burst_keys = pane_input_burst_keys.saturating_add(2);
+                    // Prefer arboard; fall back to crossterm's `text` if the
+                    // clipboard read fails *or* returns empty (some platform
+                    // edge cases — non-text-only clipboards, locked-by-
+                    // another-process — can yield `Ok("")` while crossterm's
+                    // own buffered text is non-empty).
+                    let content: Vec<u8> =
+                        match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+                            Ok(s) if !s.is_empty() => s.into_bytes(),
+                            _ => text.into_bytes(),
+                        };
+                    let now = std::time::Instant::now();
+                    let is_chunk_dup = paste_event_is_chunk_dup(
+                        paste_dedup.as_ref(),
+                        &content,
+                        now,
+                        PASTE_CHUNK_DEDUP_WINDOW,
+                    );
+                    if !is_chunk_dup {
+                        pane_input_burst.extend_from_slice(&content);
+                        // Use `2` as the burst-key count even for a single-byte
+                        // paste so the flush always takes the paste branch
+                        // (strip trailing newlines + wrap) rather than the
+                        // single-keystroke pass-through branch.
+                        pane_input_burst_keys = pane_input_burst_keys.saturating_add(2);
+                    }
+                    // Always refresh the dedup window so subsequent chunks
+                    // arriving up to PASTE_CHUNK_DEDUP_WINDOW later — whether
+                    // they fall in this drain or a later one — are also
+                    // recognized as parts of the same logical paste.
+                    paste_dedup = Some((content, now));
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
@@ -10580,5 +10673,96 @@ mod tests {
                 renderer_right_width
             );
         }
+    }
+
+    // ----- Paste-event chunk dedup ---------------------------------------
+
+    #[test]
+    fn paste_chunk_dup_returns_false_when_no_prev() {
+        let now = std::time::Instant::now();
+        assert!(!paste_event_is_chunk_dup(
+            None,
+            b"anything",
+            now,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        ));
+    }
+
+    #[test]
+    fn paste_chunk_dup_returns_true_for_same_content_within_window() {
+        // Models the chunked-paste case: a second Event::Paste arrives a few
+        // ms after the first with identical clipboard content. Should be
+        // treated as a duplicate so we don't double-append to the burst.
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let prev = (b"hello world".to_vec(), t0);
+        assert!(paste_event_is_chunk_dup(
+            Some(&prev),
+            b"hello world",
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        ));
+    }
+
+    #[test]
+    fn paste_chunk_dup_returns_true_even_after_a_slow_render_gap() {
+        // The window has to absorb the time between drain N's flush and
+        // drain N+1 seeing the next chunk (PTY write + ratatui render +
+        // event read). 300 ms is well within PASTE_CHUNK_DEDUP_WINDOW so
+        // even a sluggish render frame can't punt a chunk outside it.
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(300);
+        let prev = (b"hello world".to_vec(), t0);
+        assert!(paste_event_is_chunk_dup(
+            Some(&prev),
+            b"hello world",
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        ));
+    }
+
+    #[test]
+    fn paste_chunk_dup_returns_false_after_window_expires() {
+        // After the dedup window, the same clipboard content is treated as a
+        // fresh paste (e.g., the user really did paste twice).
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + PASTE_CHUNK_DEDUP_WINDOW + std::time::Duration::from_millis(10);
+        let prev = (b"hello world".to_vec(), t0);
+        assert!(!paste_event_is_chunk_dup(
+            Some(&prev),
+            b"hello world",
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        ));
+    }
+
+    #[test]
+    fn paste_chunk_dup_returns_false_for_different_content() {
+        // Content differs → not a chunk; honor the new paste even within
+        // the dedup window (handles the case where the user copied
+        // different content and immediately pasted it).
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let prev = (b"old".to_vec(), t0);
+        assert!(!paste_event_is_chunk_dup(
+            Some(&prev),
+            b"new",
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        ));
+    }
+
+    #[test]
+    fn paste_chunk_dup_window_boundary_is_exclusive() {
+        // `< window` — exactly at the boundary is *not* a duplicate.
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + PASTE_CHUNK_DEDUP_WINDOW;
+        let prev = (b"x".to_vec(), t0);
+        assert!(!paste_event_is_chunk_dup(
+            Some(&prev),
+            b"x",
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        ));
     }
 }
