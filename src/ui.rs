@@ -1003,6 +1003,7 @@ fn dispatch_delegate_events(
     pane: &Arc<dyn PaneController>,
     tab_manager: &mut TabManager,
     ui: &mut UiState,
+    frame_area: Rect,
 ) {
     // 1. Drain all pending delegate events under a short write-lock.
     let events: Vec<_> = state.blocking_write().delegate_events.drain(..).collect();
@@ -1065,7 +1066,29 @@ fn dispatch_delegate_events(
 
                 let _ = pane.close_pane(&old_pane_id);
 
-                let new_pane_id = match pane.create_pane(None, Some(&cwd)) {
+                // Spawn the restart pane at the orchestration-layout chunk
+                // size so the agent's first redraw doesn't go through the
+                // 24×80 → real-size shrink that surfaces as stacked
+                // duplicate prompts. Mirrors the new-pane fix.
+                let role_count = config.roles.len() as u16;
+                let start_idx = config.roles.iter().position(|r| r.start).unwrap_or(0);
+                let (rows, cols) = compute_dashboard_pane_inner_size(
+                    frame_area,
+                    DashboardSplit::Orchestration,
+                    ui.pane_layout,
+                    role_count,
+                    role_idx == start_idx,
+                    tab_manager.show_tab_bar(),
+                );
+                let create_result = if rows > 0
+                    && cols > 0
+                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                {
+                    embedded.create_pane_with_size(None, Some(&cwd), rows, cols)
+                } else {
+                    pane.create_pane(None, Some(&cwd))
+                };
+                let new_pane_id = match create_result {
                     Ok(id) => id,
                     Err(e) => {
                         tracing::error!(role = %role.name, error = %e, "dispatch: failed to create pane");
@@ -2680,6 +2703,10 @@ pub fn run_tui(
         }
         // Restore mode tabs — create agent pane (empty shell), open mode tab,
         // resize PTYs, then send init + agent commands at the right size.
+        //
+        // Track fallback dashboard panes so each one's spawn size is
+        // computed against the right post-spawn count.
+        let mut mode_fallback_count: u16 = 0;
         for (saved_pane, mode_config) in deferred_mode_panes {
             match pane.create_pane(None, Some(&saved_pane.dir)) {
                 Ok(new_id) => {
@@ -2735,12 +2762,27 @@ pub fn run_tui(
                             ));
                             // Fallback: plain dashboard pane so the user still
                             // gets a usable pane (PRD #69 acceptance criterion).
+                            // Spawn at layout size to avoid the 24×80 startup
+                            // race (matches the new-pane + restore paths).
                             let cmd = if saved_pane.command.is_empty() {
                                 None
                             } else {
                                 Some(saved_pane.command.as_str())
                             };
-                            match pane.create_pane(cmd, Some(&saved_pane.dir)) {
+                            mode_fallback_count = mode_fallback_count.saturating_add(1);
+                            let frame_area = terminal.get_frame().area();
+                            let count_after =
+                                predicted_dashboard_count.saturating_add(mode_fallback_count);
+                            match create_dashboard_pane_at_layout_size(
+                                &*pane,
+                                frame_area,
+                                restore_layout,
+                                restore_show_tab_bar,
+                                count_after,
+                                false,
+                                cmd,
+                                Some(&saved_pane.dir),
+                            ) {
                                 Ok(fb_id) => {
                                     {
                                         let mut st = state.blocking_write();
@@ -2779,7 +2821,20 @@ pub fn run_tui(
                     } else {
                         Some(saved_pane.command.as_str())
                     };
-                    match pane.create_pane(cmd, Some(&saved_pane.dir)) {
+                    // Spawn fallback dashboard pane at layout size.
+                    mode_fallback_count = mode_fallback_count.saturating_add(1);
+                    let frame_area = terminal.get_frame().area();
+                    let count_after = predicted_dashboard_count.saturating_add(mode_fallback_count);
+                    match create_dashboard_pane_at_layout_size(
+                        &*pane,
+                        frame_area,
+                        restore_layout,
+                        restore_show_tab_bar,
+                        count_after,
+                        false,
+                        cmd,
+                        Some(&saved_pane.dir),
+                    ) {
                         Ok(fb_id) => {
                             {
                                 let mut st = state.blocking_write();
@@ -3112,7 +3167,14 @@ pub fn run_tui(
         }
 
         // M5: Dispatch delegation events from orchestrator to workers.
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        let dispatch_frame_area = terminal.get_frame().area();
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            dispatch_frame_area,
+        );
 
         // M5b: Forward worker results back to the orchestrator.
         feedback_worker_results(&state, &pane, &mut tab_manager, &mut ui);
@@ -4111,8 +4173,28 @@ pub fn run_tui(
                         // Orchestration path — manage own panes, no agent pane.
                         if let Some(orch_config) = req.orchestration_config {
                             let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
-                            match tab_manager.open_orchestration_tab(&orch_config, &dir_str, prompt)
-                            {
+                            let frame_area = terminal.get_frame().area();
+                            let role_count = orch_config.roles.len() as u16;
+                            let start_idx =
+                                orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                            let role_sizes: Vec<(u16, u16)> = (0..orch_config.roles.len())
+                                .map(|i| {
+                                    compute_dashboard_pane_inner_size(
+                                        frame_area,
+                                        DashboardSplit::Orchestration,
+                                        ui.pane_layout,
+                                        role_count,
+                                        i == start_idx,
+                                        tab_manager.show_tab_bar(),
+                                    )
+                                })
+                                .collect();
+                            match tab_manager.open_orchestration_tab(
+                                &orch_config,
+                                &dir_str,
+                                prompt,
+                                Some(&role_sizes),
+                            ) {
                                 Ok((_tab_idx, role_pane_ids)) => {
                                     {
                                         let mut st = state.blocking_write();
@@ -9039,7 +9121,13 @@ mod tests {
             });
         }
 
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 100, 30),
+        );
 
         assert!(ui.pending_dispatches.is_empty());
         assert!(state.blocking_read().delegate_events.is_empty());
@@ -9067,7 +9155,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
         let (_, role_pane_ids) = tab_manager
-            .open_orchestration_tab(&config, cwd, None)
+            .open_orchestration_tab(&config, cwd, None, None)
             .unwrap();
 
         let orch_pane_id = role_pane_ids[0].clone();
@@ -9089,7 +9177,13 @@ mod tests {
         }
 
         let mut ui = default_ui();
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 100, 30),
+        );
 
         // Should not panic or queue anything — just warn and skip.
         assert!(ui.pending_dispatches.is_empty());
@@ -9281,7 +9375,7 @@ mod tests {
         let state = Arc::new(tokio::sync::RwLock::new(AppState::default()));
 
         let (_, role_pane_ids) = tab_manager
-            .open_orchestration_tab(config, cwd, None)
+            .open_orchestration_tab(config, cwd, None, None)
             .unwrap();
 
         // Register all panes in state with role and cwd mappings.
@@ -9333,7 +9427,13 @@ mod tests {
             });
         }
 
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 100, 30),
+        );
 
         // Both workers should have received prompts.
         let written = mock.written.lock().unwrap();
@@ -9386,7 +9486,13 @@ mod tests {
             });
         }
 
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 100, 30),
+        );
 
         // Old panes should be closed.
         let closed = mock.closed.lock().unwrap();
@@ -9455,7 +9561,13 @@ mod tests {
             });
         }
 
-        dispatch_delegate_events(&state, &pane, &mut tab_manager, &mut ui);
+        dispatch_delegate_events(
+            &state,
+            &pane,
+            &mut tab_manager,
+            &mut ui,
+            Rect::new(0, 0, 100, 30),
+        );
 
         let written = mock.written.lock().unwrap();
 
