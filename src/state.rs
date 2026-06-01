@@ -203,9 +203,20 @@ impl AppState {
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
         // Only accept events from panes managed by our app.
-        // Events without a pane_id (external agents) are rejected when we have
-        // managed panes. Events with an unknown pane_id are rejected unless it
-        // is a SessionStart (which may arrive before register_pane during startup).
+        //
+        // Events *with* a pane_id are accepted when we recognise that pane,
+        // or auto-registered on SessionStart (to absorb the startup race
+        // where the first hook can fire before `register_pane` lands).
+        //
+        // Events *without* a pane_id are external — they come from
+        // Copilot/Claude/etc. processes the user runs outside our managed
+        // panes (e.g., a separate terminal). We reject them
+        // unconditionally rather than gating on
+        // `!managed_pane_ids.is_empty()`, because the empty-pane-set
+        // gate let those externals slip through during the brief window
+        // between daemon startup and the first pane spawn, creating a
+        // ghost session card that the user could never focus, dismiss,
+        // or even map back to a real process.
         if let Some(ref pane_id) = event.pane_id {
             if !self.managed_pane_ids.contains(pane_id) {
                 if event.event_type == EventType::SessionStart {
@@ -216,7 +227,7 @@ impl AppState {
                     return;
                 }
             }
-        } else if !self.managed_pane_ids.is_empty() {
+        } else {
             return;
         }
         if let Some(ref pane_id) = event.pane_id
@@ -504,7 +515,13 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
-            pane_id: None,
+            // Default pane_id so tests can fire events through
+            // `apply_event` without each being rejected by the
+            // pane-id-required gate. Tests that don't fire
+            // `EventType::SessionStart` first (and therefore don't
+            // auto-register this pane) must call
+            // `state.register_pane("test-pane".into())` explicitly.
+            pane_id: Some("test-pane".to_string()),
         }
     }
 
@@ -537,11 +554,18 @@ mod tests {
     fn concurrent_sessions() {
         let mut state = AppState::default();
 
-        state.apply_event(make_event("s1", EventType::SessionStart));
-        state.apply_event(make_event("s2", EventType::SessionStart));
+        // Two sessions on two distinct panes so the pane-id-based merge
+        // logic doesn't collapse them.
+        let mut s1_start = make_event("s1", EventType::SessionStart);
+        s1_start.pane_id = Some("pane-1".to_string());
+        state.apply_event(s1_start);
+        let mut s2_start = make_event("s2", EventType::SessionStart);
+        s2_start.pane_id = Some("pane-2".to_string());
+        state.apply_event(s2_start);
         assert_eq!(state.sessions.len(), 2);
 
         let mut tool_event = make_event("s1", EventType::ToolStart);
+        tool_event.pane_id = Some("pane-1".to_string());
         tool_event.tool_name = Some("Write".to_string());
         state.apply_event(tool_event);
 
@@ -570,6 +594,10 @@ mod tests {
     #[test]
     fn auto_create_unknown_session() {
         let mut state = AppState::default();
+        // The pane needs to be registered before non-SessionStart events
+        // are accepted (otherwise apply_event rejects them via the
+        // managed-pane gate that prevents phantom external sessions).
+        state.register_pane("test-pane".to_string());
 
         let mut tool_event = make_event("unknown", EventType::ToolStart);
         tool_event.tool_name = Some("Bash".to_string());
@@ -577,6 +605,49 @@ mod tests {
 
         assert!(state.sessions.contains_key("unknown"));
         assert_eq!(state.sessions["unknown"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn external_event_without_pane_id_is_rejected_even_when_no_panes_managed() {
+        // Regression guard for the "phantom card" bug: when a user runs a
+        // Copilot/Claude/etc. process *outside* dot-agent-deck (e.g., in a
+        // separate terminal) while dot-agent-deck happens to be running
+        // with no panes yet, the external process's hook events would
+        // arrive over the daemon socket with `pane_id = None`. Earlier
+        // logic accepted these because `managed_pane_ids.is_empty()` was
+        // treated as "no constraint" — creating a ghost session entry
+        // that the user could never focus, dismiss, or even map back to
+        // a real pane. We must reject pane_id=None events
+        // unconditionally.
+        let mut state = AppState::default();
+        assert!(state.managed_pane_ids.is_empty());
+
+        let mut ext = make_event("external-uuid", EventType::SessionStart);
+        ext.pane_id = None;
+        state.apply_event(ext);
+
+        assert!(
+            !state.sessions.contains_key("external-uuid"),
+            "events without a pane_id must never create a session entry, \
+             even when no panes are managed yet"
+        );
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn external_event_without_pane_id_is_rejected_after_panes_registered() {
+        // Same guard, with managed panes already present. Belt-and-
+        // suspenders so a future refactor that splits the rejection
+        // logic still catches both cases.
+        let mut state = AppState::default();
+        state.register_pane("our-pane".to_string());
+
+        let mut ext = make_event("external-uuid", EventType::ToolStart);
+        ext.pane_id = None;
+        ext.tool_name = Some("Bash".to_string());
+        state.apply_event(ext);
+
+        assert!(!state.sessions.contains_key("external-uuid"));
     }
 
     #[test]
@@ -834,26 +905,33 @@ mod tests {
     #[test]
     fn aggregate_stats_mixed_sessions() {
         let mut state = AppState::default();
+        // Five distinct sessions need five distinct panes so they
+        // don't collapse via the pane-id auto-merge in apply_event.
+        let with_pane = |sid: &str, ev: EventType, pane: &str| {
+            let mut e = make_event(sid, ev);
+            e.pane_id = Some(pane.to_string());
+            e
+        };
 
-        state.apply_event(make_event("s1", EventType::SessionStart));
-        let mut tool = make_event("s1", EventType::ToolStart);
+        state.apply_event(with_pane("s1", EventType::SessionStart, "p1"));
+        let mut tool = with_pane("s1", EventType::ToolStart, "p1");
         tool.tool_name = Some("Read".to_string());
         state.apply_event(tool);
         // s1: Working
 
-        state.apply_event(make_event("s2", EventType::SessionStart));
-        state.apply_event(make_event("s2", EventType::WaitingForInput));
+        state.apply_event(with_pane("s2", EventType::SessionStart, "p2"));
+        state.apply_event(with_pane("s2", EventType::WaitingForInput, "p2"));
         // s2: WaitingForInput
 
-        state.apply_event(make_event("s3", EventType::SessionStart));
-        state.apply_event(make_event("s3", EventType::Error));
+        state.apply_event(with_pane("s3", EventType::SessionStart, "p3"));
+        state.apply_event(with_pane("s3", EventType::Error, "p3"));
         // s3: Error
 
-        state.apply_event(make_event("s4", EventType::SessionStart));
-        state.apply_event(make_event("s4", EventType::Thinking));
+        state.apply_event(with_pane("s4", EventType::SessionStart, "p4"));
+        state.apply_event(with_pane("s4", EventType::Thinking, "p4"));
         // s4: Thinking
 
-        state.apply_event(make_event("s5", EventType::SessionStart));
+        state.apply_event(with_pane("s5", EventType::SessionStart, "p5"));
         // s5: Idle
 
         let stats = state.aggregate_stats();

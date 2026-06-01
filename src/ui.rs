@@ -6525,7 +6525,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
-            pane_id: None,
+            pane_id: Some("pane-s1".to_string()),
         };
         state.apply_event(event.clone());
 
@@ -7055,7 +7055,10 @@ mod tests {
                 timestamp: Utc::now(),
                 user_prompt: None,
                 metadata: HashMap::new(),
-                pane_id: None,
+                // Distinct pane per session so apply_event's
+                // pane-id-required gate accepts each one and the
+                // pane-id-merge doesn't collapse them.
+                pane_id: Some(format!("pane-{id}")),
             });
         }
 
@@ -7078,7 +7081,7 @@ mod tests {
                 timestamp: Utc::now(),
                 user_prompt: None,
                 metadata: HashMap::new(),
-                pane_id: None,
+                pane_id: Some(format!("pane-{id}")),
             });
         }
 
@@ -7102,7 +7105,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
-            pane_id: None,
+            pane_id: Some("pane-s1".to_string()),
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -7114,7 +7117,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
-            pane_id: None,
+            pane_id: Some("pane-s2".to_string()),
         });
 
         let mut ui = default_ui();
@@ -7137,7 +7140,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
-            pane_id: None,
+            pane_id: Some("pane-s1".to_string()),
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -7149,7 +7152,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
-            pane_id: None,
+            pane_id: Some("pane-s2".to_string()),
         });
 
         let mut ui = default_ui();
@@ -7174,7 +7177,7 @@ mod tests {
             timestamp: Utc::now(),
             user_prompt: None,
             metadata: HashMap::new(),
-            pane_id: None,
+            pane_id: Some("pane-MySession".to_string()),
         });
 
         let mut ui = default_ui();
