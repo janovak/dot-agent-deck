@@ -341,12 +341,30 @@ impl AppState {
     /// session has been working for at least `timeout` without firing any
     /// new event and without an active tool. This catches the case where
     /// an agent stalls at an interactive prompt that has no corresponding
-    /// hook event (e.g., Copilot CLI printing a multiple-choice menu and
+    /// hook event (e.g., Copilot CLI printing a "1/2/3 — pick one" menu and
     /// waiting on stdin).
     ///
     /// Returns the set of session IDs that just transitioned so callers
     /// can fire a bell or update other side-effects exactly once per
     /// transition.
+    ///
+    /// **Clock-skew defence.** Uses wall-clock `Utc::now()` rather than a
+    /// monotonic source so a long laptop sleep, NTP correction, or manual
+    /// clock change can spike `signed_duration_since(last_activity)` to
+    /// arbitrarily large values. To prevent a barrage of false Pending
+    /// flips (and bell rings) on system resume, durations above
+    /// `CLOCK_SKEW_REJECTION_THRESHOLD` are treated as "the clock just
+    /// jumped, can't trust this" and skipped. The threshold is chosen
+    /// generously enough that no realistic Working-session timeout would
+    /// ever exceed it.
+    ///
+    /// **By-design caveat.** The heuristic intentionally cannot distinguish
+    /// "agent is stuck at a non-hook prompt" from "agent is taking longer
+    /// than `timeout` to decide its next move between tools". Both look
+    /// like `status=Working AND active_tool=None`. The default 10 s timeout
+    /// is generous enough for typical sub-second LLM gaps; if a user runs
+    /// into the false-positive case they can tune `pending.timeout_seconds`
+    /// up or set it to 0 to disable the heuristic entirely.
     pub fn apply_pending_timeout(&mut self, timeout: chrono::Duration) -> Vec<String> {
         let now = Utc::now();
         let mut transitioned = Vec::new();
@@ -357,7 +375,13 @@ impl AppState {
             if session.active_tool.is_some() {
                 continue;
             }
-            if now.signed_duration_since(session.last_activity) >= timeout {
+            let elapsed = now.signed_duration_since(session.last_activity);
+            // Reject negative (clock went backward) and absurdly large
+            // values (clock jumped forward — sleep/NTP/manual change).
+            if elapsed < chrono::Duration::zero() || elapsed > CLOCK_SKEW_REJECTION_THRESHOLD {
+                continue;
+            }
+            if elapsed >= timeout {
                 session.status = SessionStatus::Pending;
                 transitioned.push(sid.clone());
             }
@@ -365,6 +389,15 @@ impl AppState {
         transitioned
     }
 }
+
+/// Maximum trusted elapsed-time-since-last-activity that
+/// `apply_pending_timeout` will act on. Values above this are taken as
+/// evidence the system clock jumped (laptop sleep, NTP, manual clock
+/// change) rather than as a real measurement, and the heuristic skips
+/// the session to avoid firing a flood of false Pending flips on system
+/// resume. 24 h is large enough that no realistic `pending.timeout_seconds`
+/// value would be missed by this guard.
+const CLOCK_SKEW_REJECTION_THRESHOLD: chrono::Duration = chrono::Duration::hours(24);
 
 #[cfg(test)]
 mod tests {
@@ -1138,6 +1171,68 @@ mod tests {
         let stats = state.aggregate_stats();
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.working, 0);
+    }
+
+    #[test]
+    fn pending_timeout_skips_negative_elapsed_from_clock_going_backward() {
+        // If the system clock moved backward (NTP correction, manual
+        // change), `signed_duration_since(last_activity)` returns a
+        // negative value. The guard must skip these sessions rather than
+        // pass the >= timeout check on negative numbers (chrono does the
+        // sane thing here, but we want explicit coverage of the case).
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        // last_activity in the future = clock moved backward.
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() + chrono::Duration::seconds(60);
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(transitioned.is_empty());
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn pending_timeout_skips_implausibly_large_elapsed_from_laptop_sleep() {
+        // Regression guard against the user-facing bug "every Working
+        // session fires Pending on laptop resume". After a multi-hour
+        // sleep, `Utc::now()` jumps forward and every session looks
+        // ancient — but the right action is to skip them entirely
+        // (treat as "clock just jumped") rather than fire a barrage of
+        // bells the user will find at 9am.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        // Simulate ~48h of laptop sleep.
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::hours(48);
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(
+            transitioned.is_empty(),
+            "48h elapsed should be treated as clock skew, not as a real Pending stall"
+        );
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn pending_timeout_fires_at_boundary_just_under_clock_skew_threshold() {
+        // The skew rejection must not be so aggressive that it eats real
+        // long timeouts. A session that's been Working for 23 hours with
+        // a 23h timeout should still fire — we only skip *above* the
+        // 24h threshold.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::hours(23);
+        let transitioned = state.apply_pending_timeout(chrono::Duration::hours(22));
+        assert_eq!(transitioned, vec!["s1".to_string()]);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
     }
 
     fn make_event_with_pane(session_id: &str, event_type: EventType, pane_id: &str) -> AgentEvent {

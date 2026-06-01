@@ -7196,6 +7196,76 @@ mod tests {
         assert!(need_bell);
     }
 
+    #[test]
+    fn bell_suppression_applies_to_all_bell_worthy_statuses_when_engaged() {
+        // The suppression rule is intentionally status-agnostic: if the
+        // user is in PaneInput on the pane, ANY bell-worthy transition
+        // (Pending, WaitingForInput, Error) is suppressed because the
+        // user is staring at the pane and will see the change. Locks in
+        // the current behavior so a future refactor that narrows the
+        // suppression to only Pending would break this test.
+        for status in [
+            SessionStatus::Pending,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Error,
+        ] {
+            let mut sessions = HashMap::new();
+            sessions.insert(
+                "s1".into(),
+                make_session_with_pane(status.clone(), "pane-1"),
+            );
+            let mut last = HashMap::new();
+            last.insert("s1".into(), SessionStatus::Working);
+            let (need_bell, new_map) = compute_bell_needed(
+                &sessions,
+                &last,
+                &BellConfig::default(),
+                Some("pane-1"),
+                true,
+            );
+            assert!(
+                !need_bell,
+                "bell should be suppressed for {status:?} when user is engaged with that pane"
+            );
+            // last_bell_status still updated so subsequent transitions
+            // are computed correctly when the user disengages.
+            assert_eq!(new_map.get("s1"), Some(&status));
+        }
+    }
+
+    #[test]
+    fn bell_rings_for_bell_worthy_statuses_when_user_not_engaged() {
+        // Mirror of the suppression test: when the user is NOT in
+        // PaneInput on the pane, every bell-worthy status transition
+        // rings the bell. Together with the suppression test this
+        // documents the full bell-vs-no-bell decision table.
+        for status in [
+            SessionStatus::Pending,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Error,
+        ] {
+            let mut sessions = HashMap::new();
+            sessions.insert(
+                "s1".into(),
+                make_session_with_pane(status.clone(), "pane-1"),
+            );
+            let mut last = HashMap::new();
+            last.insert("s1".into(), SessionStatus::Working);
+            // Dashboard view (not in PaneInput) — bell rings.
+            let (need_bell, _) = compute_bell_needed(
+                &sessions,
+                &last,
+                &BellConfig::default(),
+                Some("pane-1"),
+                false, // not in PaneInput
+            );
+            assert!(
+                need_bell,
+                "bell should ring for {status:?} when user is on the dashboard"
+            );
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Card density tests
     // ---------------------------------------------------------------------------
