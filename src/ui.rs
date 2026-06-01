@@ -1659,39 +1659,6 @@ fn strip_paste_trailing_newlines_bytes(bytes: &[u8]) -> &[u8] {
     &bytes[..end]
 }
 
-/// Decide whether a freshly-arrived `Event::Paste` payload is a *chunk
-/// duplicate* of the immediately preceding one — i.e., another part of
-/// the same logical Ctrl+V whose content was already appended to the
-/// burst on the first chunk.
-///
-/// Some terminals (Windows Terminal in particular) split a single Ctrl+V
-/// of large or table-style content into multiple bracketed-paste
-/// sequences and deliver them as separate `Event::Paste` events,
-/// sometimes with a tiny scheduling gap between them so the event drain
-/// breaks in-between. To rebuild the original logical paste, the
-/// `Event::Paste` handler reads the *full* clipboard via arboard on the
-/// first chunk and appends it to the burst; subsequent chunks must be
-/// skipped — but only when they really are chunks of the same paste,
-/// not when the user is intentionally pasting again.
-///
-/// "Chunk" here means: same clipboard content as the previous chunk,
-/// arriving within `window` of it. The caller resets `prev` to `None`
-/// whenever a non-Paste event is processed, so the dedup never bridges
-/// a user action.
-fn paste_event_is_chunk_dup(
-    prev: Option<&(Vec<u8>, std::time::Instant)>,
-    content: &[u8],
-    now: std::time::Instant,
-    window: std::time::Duration,
-) -> bool {
-    match prev {
-        Some((prev_bytes, prev_time)) => {
-            prev_bytes.as_slice() == content && now.duration_since(*prev_time) < window
-        }
-        None => false,
-    }
-}
-
 /// Maximum gap between consecutive `Event::Paste` events that we still
 /// treat as parts of the same logical Ctrl+V. Sized generously so even
 /// slow render frames between chunks (heavy dashboard, big terminal,
@@ -1700,6 +1667,202 @@ fn paste_event_is_chunk_dup(
 /// pastes of identical content within this window are deduped to one —
 /// a vanishingly rare workflow.
 const PASTE_CHUNK_DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// If an arboard `get_text()` call takes longer than this, emit a
+/// status-bar warning so the user has a diagnosable footprint for the
+/// known clipboard-contention freeze risk. The clipboard read is
+/// synchronous on the UI thread; this commit moves it from a niche
+/// path (right-click) to every bracketed paste, so making slow reads
+/// visible matters.
+const PASTE_ARBOARD_SLOW_READ_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Inner-drain `poll(...)` timeout once a PaneInput burst has at least
+/// one key buffered. Windows Terminal flushes pasted clipboard content
+/// as individual key Press events (no `Event::Paste`) with small (~1–2
+/// ms) gaps between consecutive events, plus interleaved key-Release
+/// events that aren't burst-relevant. Without this wait the drain
+/// breaks at the first inter-event gap, flushing a single key as raw
+/// bytes (no bracketed-paste wrap) and leaving the rest of the paste
+/// to be re-bursted — the `C[21 lines]` artifact users see when
+/// pasting capitalized words. 1 ms is the smallest value that still
+/// imperceptibly bridges the observed inter-event gap; well below
+/// the ~10 ms typing-latency-perception floor, and only applies once
+/// a burst is in progress (so no-input idle time isn't affected).
+const PASTE_BURST_DRAIN_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Whether the dedup baseline came from arboard (the full clipboard,
+/// which we treat as authoritative) or from crossterm's per-chunk
+/// `text` payload (only what arrived in this particular bracketed-paste
+/// envelope, used as a fallback when arboard fails or returns empty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasteSource {
+    Authoritative,
+    Fallback,
+}
+
+/// Persistent state across `Event::Paste` events while inside a single
+/// logical Ctrl+V whose chunks Windows Terminal split into multiple
+/// bracketed-paste envelopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasteDedupState {
+    /// Content we last appended (or skipped a duplicate against). For
+    /// authoritative baselines this is the full clipboard; for
+    /// fallback baselines it's the accumulated per-chunk bytes.
+    baseline: Vec<u8>,
+    /// Last time we saw a chunk for this baseline. Refreshed even on
+    /// `Skip` so the window stays open for all chunks of the burst.
+    time: std::time::Instant,
+    /// Where `baseline` came from.
+    source: PasteSource,
+    /// How many bytes we have appended to the keystroke burst for this
+    /// logical paste. Used to drop the trailing fallback bytes when a
+    /// later authoritative read supersedes them.
+    appended_len: usize,
+}
+
+/// One of three things the `Event::Paste` handler should do with a
+/// freshly-arrived paste payload, based on the dedup state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PasteAction {
+    /// Do not modify the keystroke burst. The chunk is either a true
+    /// duplicate or a fallback re-read of a payload we already
+    /// captured authoritatively earlier in this burst.
+    Skip,
+    /// Append these bytes to the keystroke burst.
+    Append(Vec<u8>),
+    /// Drop the trailing `drop` bytes from the keystroke burst (the
+    /// previously-appended fallback chunks for this paste) and append
+    /// `append` (the authoritative full clipboard). Fires when arboard
+    /// succeeds on a later chunk after failing on an earlier one.
+    ReplaceTail { drop: usize, append: Vec<u8> },
+}
+
+/// Decide what to do with a freshly-arrived `Event::Paste` payload.
+///
+/// `prev` is the dedup state from the previous chunk (or `None` if no
+/// chunk has been seen yet in this burst, or the window has expired).
+/// `arboard` is the result of reading the system clipboard for THIS
+/// event — `Some(bytes)` on success with non-empty content, `None` on
+/// failure or empty content. `crossterm_text` is the per-chunk payload
+/// crossterm delivered (the bytes inside this particular bracketed
+/// paste envelope), used only as a fallback when arboard fails.
+///
+/// Returns the action to apply to the keystroke burst and the new
+/// dedup state to persist for the next chunk.
+///
+/// The function is intentionally pure (no I/O) so all the edge cases
+/// — succeed→fail, fail→succeed, succeed→same, succeed→different —
+/// can be covered by unit tests.
+fn decide_paste_action(
+    prev: Option<&PasteDedupState>,
+    arboard: Option<Vec<u8>>,
+    crossterm_text: Vec<u8>,
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> (PasteAction, Option<PasteDedupState>) {
+    let prev = prev.filter(|p| now.duration_since(p.time) < window);
+
+    match (prev, arboard) {
+        // No baseline (fresh paste or window expired) + arboard OK
+        // → append the full clipboard, baseline authoritative.
+        (None, Some(s)) => {
+            let new_state = PasteDedupState {
+                baseline: s.clone(),
+                time: now,
+                source: PasteSource::Authoritative,
+                appended_len: s.len(),
+            };
+            (PasteAction::Append(s), Some(new_state))
+        }
+        // No baseline + arboard failed → append per-chunk fallback,
+        // baseline is non-authoritative.
+        (None, None) => {
+            let new_state = PasteDedupState {
+                baseline: crossterm_text.clone(),
+                time: now,
+                source: PasteSource::Fallback,
+                appended_len: crossterm_text.len(),
+            };
+            (PasteAction::Append(crossterm_text), Some(new_state))
+        }
+        // Authoritative baseline + arboard OK
+        (Some(p), Some(s)) if p.source == PasteSource::Authoritative => {
+            if s == p.baseline {
+                // True dedup hit — second envelope for the same logical paste.
+                let mut new_state = p.clone();
+                new_state.time = now;
+                (PasteAction::Skip, Some(new_state))
+            } else {
+                // Clipboard contents changed within the window: treat
+                // as a separate intentional paste.
+                let new_state = PasteDedupState {
+                    baseline: s.clone(),
+                    time: now,
+                    source: PasteSource::Authoritative,
+                    appended_len: s.len(),
+                };
+                (PasteAction::Append(s), Some(new_state))
+            }
+        }
+        // Authoritative baseline + arboard failed → skip the fallback
+        // chunk. The authoritative read already captured the full
+        // clipboard; the per-chunk crossterm text is a tail/prefix
+        // slice of what we already have. (This is the exact bug the
+        // reviewer flagged: previously we would have appended this
+        // fallback on top of the authoritative content.)
+        (Some(p), None) if p.source == PasteSource::Authoritative => {
+            let mut new_state = p.clone();
+            new_state.time = now;
+            (PasteAction::Skip, Some(new_state))
+        }
+        // Fallback baseline + arboard OK
+        (Some(p), Some(s)) => {
+            // If the authoritative full content contains the chunks we
+            // already appended (as a prefix or suffix), supersede them.
+            // The chunked-paste pattern always feeds prefix-first, so
+            // `starts_with` is the common path; `ends_with` covers the
+            // rare race where the first read got only the tail.
+            if s.starts_with(&p.baseline) || s.ends_with(&p.baseline) {
+                let new_state = PasteDedupState {
+                    baseline: s.clone(),
+                    time: now,
+                    source: PasteSource::Authoritative,
+                    appended_len: s.len(),
+                };
+                (
+                    PasteAction::ReplaceTail {
+                        drop: p.appended_len,
+                        append: s,
+                    },
+                    Some(new_state),
+                )
+            } else {
+                // Unrelated content → treat as a new paste.
+                let new_state = PasteDedupState {
+                    baseline: s.clone(),
+                    time: now,
+                    source: PasteSource::Authoritative,
+                    appended_len: s.len(),
+                };
+                (PasteAction::Append(s), Some(new_state))
+            }
+        }
+        // Fallback baseline + arboard failed again → keep accumulating
+        // fallback chunks; this is the existing degraded behavior when
+        // arboard is broken on the host.
+        (Some(p), None) => {
+            let mut combined = p.baseline.clone();
+            combined.extend_from_slice(&crossterm_text);
+            let new_state = PasteDedupState {
+                baseline: combined,
+                time: now,
+                source: PasteSource::Fallback,
+                appended_len: p.appended_len + crossterm_text.len(),
+            };
+            (PasteAction::Append(crossterm_text), Some(new_state))
+        }
+    }
+}
 
 /// Flush a buffered burst of PaneInput keystrokes to the focused pane.
 ///
@@ -2939,7 +3102,7 @@ pub fn run_tui(
     // multiple paste events with the event drain breaking between
     // them. Reset on any non-Paste event so the dedup never bridges
     // a user action.
-    let mut paste_dedup: Option<(Vec<u8>, std::time::Instant)> = None;
+    let mut paste_dedup: Option<PasteDedupState> = None;
 
     'outer: loop {
         // Expire stale status messages
@@ -3745,36 +3908,66 @@ pub fn run_tui(
             // arboard) and is why right-click never exhibits the bug.
             if let Event::Paste(text) = ev {
                 if ui.mode == UiMode::PaneInput {
-                    // Prefer arboard; fall back to crossterm's `text` if the
-                    // clipboard read fails *or* returns empty (some platform
-                    // edge cases — non-text-only clipboards, locked-by-
-                    // another-process — can yield `Ok("")` while crossterm's
-                    // own buffered text is non-empty).
-                    let content: Vec<u8> =
-                        match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
-                            Ok(s) if !s.is_empty() => s.into_bytes(),
-                            _ => text.into_bytes(),
-                        };
+                    // Read the full clipboard via arboard. On success, this
+                    // is the authoritative content (the same bytes the user
+                    // most recently put on the clipboard with Ctrl+C). On
+                    // failure or empty result we fall back to crossterm's
+                    // per-chunk `text` — but `decide_paste_action` knows
+                    // how to suppress a fallback chunk that's already
+                    // covered by an earlier authoritative read, and how
+                    // to replace previously-appended fallback bytes when
+                    // a later read succeeds.
+                    //
+                    // The read is synchronous on the UI thread; time it so
+                    // a slow Windows clipboard contention case is at least
+                    // diagnosable rather than presenting as a mystery hang.
+                    let read_start = std::time::Instant::now();
+                    let arboard_result: Option<Vec<u8>> = arboard::Clipboard::new()
+                        .and_then(|mut cb| cb.get_text())
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.into_bytes());
+                    let read_elapsed = read_start.elapsed();
+                    if read_elapsed > PASTE_ARBOARD_SLOW_READ_THRESHOLD {
+                        ui.status_message = Some((
+                            format!(
+                                "Paste: slow clipboard read ({} ms) — UI was briefly frozen",
+                                read_elapsed.as_millis()
+                            ),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                    let crossterm_text = text.into_bytes();
                     let now = std::time::Instant::now();
-                    let is_chunk_dup = paste_event_is_chunk_dup(
+                    let (action, new_state) = decide_paste_action(
                         paste_dedup.as_ref(),
-                        &content,
+                        arboard_result,
+                        crossterm_text,
                         now,
                         PASTE_CHUNK_DEDUP_WINDOW,
                     );
-                    if !is_chunk_dup {
-                        pane_input_burst.extend_from_slice(&content);
-                        // Use `2` as the burst-key count even for a single-byte
-                        // paste so the flush always takes the paste branch
-                        // (strip trailing newlines + wrap) rather than the
-                        // single-keystroke pass-through branch.
-                        pane_input_burst_keys = pane_input_burst_keys.saturating_add(2);
+                    match action {
+                        PasteAction::Skip => {}
+                        PasteAction::Append(bytes) => {
+                            pane_input_burst.extend_from_slice(&bytes);
+                            // Use `2` as the burst-key count even for a single-byte
+                            // paste so the flush always takes the paste branch
+                            // (strip trailing newlines + wrap) rather than the
+                            // single-keystroke pass-through branch.
+                            pane_input_burst_keys = pane_input_burst_keys.saturating_add(2);
+                        }
+                        PasteAction::ReplaceTail { drop, append } => {
+                            let new_len = pane_input_burst.len().saturating_sub(drop);
+                            pane_input_burst.truncate(new_len);
+                            pane_input_burst.extend_from_slice(&append);
+                            // Already counted as a paste on the previous
+                            // fallback append; bumping again is harmless
+                            // (the flush only checks `>= 2`) and keeps the
+                            // bookkeeping uniform with Append.
+                            pane_input_burst_keys = pane_input_burst_keys.saturating_add(2);
+                        }
                     }
-                    // Always refresh the dedup window so subsequent chunks
-                    // arriving up to PASTE_CHUNK_DEDUP_WINDOW later — whether
-                    // they fall in this drain or a later one — are also
-                    // recognized as parts of the same logical paste.
-                    paste_dedup = Some((content, now));
+                    paste_dedup = new_state;
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
@@ -3783,7 +3976,15 @@ pub fn run_tui(
             }
 
             let Event::Key(key) = ev else {
-                if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                // Burst-aware drain wait so non-Key events (Resize,
+                // FocusGained/Lost, Mouse) arriving mid-paste don't
+                // prematurely break the burst.
+                let drain_wait = if ui.mode == UiMode::PaneInput && pane_input_burst_keys >= 1 {
+                    PASTE_BURST_DRAIN_WAIT
+                } else {
+                    std::time::Duration::from_millis(0)
+                };
+                if !crossterm::event::poll(drain_wait)? {
                     break;
                 }
                 continue;
@@ -3791,7 +3992,20 @@ pub fn run_tui(
 
             // Only handle key-press events (ignore release/repeat on platforms that send them).
             if key.kind != crossterm::event::KeyEventKind::Press {
-                if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                // Burst-aware drain wait: Windows Terminal interleaves
+                // Press events with Release events for each key (including
+                // modifier-key Release between e.g. SHIFT+'C' and the next
+                // lowercase char). Without this wait the Release of the
+                // first paste key would hit poll(0), find the queue empty
+                // for ~2 ms while the next Press is still in flight, break
+                // the inner drain, and flush the single key as raw bytes —
+                // the `C[21 lines]` artifact from the chunked-paste bug.
+                let drain_wait = if ui.mode == UiMode::PaneInput && pane_input_burst_keys >= 1 {
+                    PASTE_BURST_DRAIN_WAIT
+                } else {
+                    std::time::Duration::from_millis(0)
+                };
+                if !crossterm::event::poll(drain_wait)? {
                     break;
                 }
                 continue;
@@ -4567,7 +4781,7 @@ pub fn run_tui(
                     // this even when bracketed-paste mode is enabled, in
                     // which case `Event::Paste` never fires).
                     let burstable = ui.mode == UiMode::PaneInput
-                        && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter)
+                        && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !key.modifiers.contains(KeyModifiers::ALT);
                     if burstable {
@@ -4615,9 +4829,17 @@ pub fn run_tui(
             // In all other modes, break immediately to re-render so UI state
             // transitions (mode changes, focus, dialogs) take effect before the
             // next event is processed.
-            if ui.mode != UiMode::PaneInput
-                || !crossterm::event::poll(std::time::Duration::from_millis(0))?
-            {
+            //
+            // While a burst is in progress (≥ 1 burstable key collected in
+            // this drain) wait briefly for the next event before exiting —
+            // see the `PASTE_BURST_DRAIN_WAIT` doc comment for the
+            // Windows-Terminal key-flood paste bug this prevents.
+            let drain_wait = if ui.mode == UiMode::PaneInput && pane_input_burst_keys >= 1 {
+                PASTE_BURST_DRAIN_WAIT
+            } else {
+                std::time::Duration::from_millis(0)
+            };
+            if ui.mode != UiMode::PaneInput || !crossterm::event::poll(drain_wait)? {
                 break;
             }
         } // end inner event-drain loop
@@ -10675,94 +10897,245 @@ mod tests {
         }
     }
 
-    // ----- Paste-event chunk dedup ---------------------------------------
+    // ----- Paste-event dedup / fallback decision -------------------------
+    //
+    // These exercise `decide_paste_action` — the pure function the
+    // `Event::Paste` handler delegates to. Each test names the scenario
+    // it covers (succeed/fail/cross-combinations) so a future regression
+    // is easy to triage.
+
+    fn auth(content: &[u8], t: std::time::Instant) -> PasteDedupState {
+        PasteDedupState {
+            baseline: content.to_vec(),
+            time: t,
+            source: PasteSource::Authoritative,
+            appended_len: content.len(),
+        }
+    }
+    fn fallback(content: &[u8], t: std::time::Instant) -> PasteDedupState {
+        PasteDedupState {
+            baseline: content.to_vec(),
+            time: t,
+            source: PasteSource::Fallback,
+            appended_len: content.len(),
+        }
+    }
 
     #[test]
-    fn paste_chunk_dup_returns_false_when_no_prev() {
+    fn paste_action_no_prev_arboard_ok_appends_full_authoritative() {
         let now = std::time::Instant::now();
-        assert!(!paste_event_is_chunk_dup(
+        let (action, state) = decide_paste_action(
             None,
-            b"anything",
+            Some(b"abcd".to_vec()),
+            b"chunk-text".to_vec(),
             now,
             PASTE_CHUNK_DEDUP_WINDOW,
-        ));
+        );
+        assert_eq!(action, PasteAction::Append(b"abcd".to_vec()));
+        let s = state.unwrap();
+        assert_eq!(s.baseline, b"abcd");
+        assert_eq!(s.source, PasteSource::Authoritative);
+        assert_eq!(s.appended_len, 4);
     }
 
     #[test]
-    fn paste_chunk_dup_returns_true_for_same_content_within_window() {
-        // Models the chunked-paste case: a second Event::Paste arrives a few
-        // ms after the first with identical clipboard content. Should be
-        // treated as a duplicate so we don't double-append to the burst.
+    fn paste_action_no_prev_arboard_fail_appends_fallback() {
+        // Degraded host (arboard broken) → fall back to crossterm text.
+        let now = std::time::Instant::now();
+        let (action, state) = decide_paste_action(
+            None,
+            None,
+            b"chunk-1".to_vec(),
+            now,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        );
+        assert_eq!(action, PasteAction::Append(b"chunk-1".to_vec()));
+        assert_eq!(state.unwrap().source, PasteSource::Fallback);
+    }
+
+    #[test]
+    fn paste_action_auth_then_auth_same_skips() {
+        // The happy-path chunked-paste dedup: second envelope arrives,
+        // arboard returns the same full content, we skip.
         let t0 = std::time::Instant::now();
         let t1 = t0 + std::time::Duration::from_millis(5);
-        let prev = (b"hello world".to_vec(), t0);
-        assert!(paste_event_is_chunk_dup(
+        let prev = auth(b"abcd", t0);
+        let (action, state) = decide_paste_action(
             Some(&prev),
-            b"hello world",
+            Some(b"abcd".to_vec()),
+            b"chunk-2".to_vec(),
             t1,
             PASTE_CHUNK_DEDUP_WINDOW,
-        ));
+        );
+        assert_eq!(action, PasteAction::Skip);
+        // Time refreshes so a third chunk arriving later also catches.
+        assert_eq!(state.unwrap().time, t1);
     }
 
     #[test]
-    fn paste_chunk_dup_returns_true_even_after_a_slow_render_gap() {
-        // The window has to absorb the time between drain N's flush and
-        // drain N+1 seeing the next chunk (PTY write + ratatui render +
-        // event read). 300 ms is well within PASTE_CHUNK_DEDUP_WINDOW so
-        // even a sluggish render frame can't punt a chunk outside it.
+    fn paste_action_auth_then_fail_skips_fallback_chunk() {
+        // The HIGH bug from the review: previously this would append the
+        // fallback "cd" on top of the authoritative "abcd" → "abcdcd".
+        // Now it must skip — we already have the full content.
         let t0 = std::time::Instant::now();
-        let t1 = t0 + std::time::Duration::from_millis(300);
-        let prev = (b"hello world".to_vec(), t0);
-        assert!(paste_event_is_chunk_dup(
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let prev = auth(b"abcd", t0);
+        let (action, state) = decide_paste_action(
             Some(&prev),
-            b"hello world",
+            None,
+            b"cd".to_vec(),
             t1,
             PASTE_CHUNK_DEDUP_WINDOW,
-        ));
+        );
+        assert_eq!(action, PasteAction::Skip);
+        // Baseline preserved so subsequent successful reads still dedup.
+        let s = state.unwrap();
+        assert_eq!(s.baseline, b"abcd");
+        assert_eq!(s.source, PasteSource::Authoritative);
     }
 
     #[test]
-    fn paste_chunk_dup_returns_false_after_window_expires() {
-        // After the dedup window, the same clipboard content is treated as a
-        // fresh paste (e.g., the user really did paste twice).
+    fn paste_action_fail_then_auth_replaces_tail_prefix_overlap() {
+        // The other half of the HIGH bug: fail-then-succeed. Previously
+        // we'd append "ab" (fallback) and then "abcd" (auth) → "ababcd".
+        // Now we must replace the previously-appended fallback bytes
+        // with the authoritative full content.
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let prev = fallback(b"ab", t0);
+        let (action, state) = decide_paste_action(
+            Some(&prev),
+            Some(b"abcd".to_vec()),
+            b"chunk-2".to_vec(),
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        );
+        assert_eq!(
+            action,
+            PasteAction::ReplaceTail {
+                drop: 2,
+                append: b"abcd".to_vec(),
+            }
+        );
+        let s = state.unwrap();
+        assert_eq!(s.source, PasteSource::Authoritative);
+        assert_eq!(s.baseline, b"abcd");
+        assert_eq!(s.appended_len, 4);
+    }
+
+    #[test]
+    fn paste_action_fail_then_auth_replaces_tail_suffix_overlap() {
+        // Same as prefix-overlap, but the fallback chunk turned out to
+        // be the *tail* of the clipboard. Still replace.
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let prev = fallback(b"cd", t0);
+        let (action, _state) = decide_paste_action(
+            Some(&prev),
+            Some(b"abcd".to_vec()),
+            b"chunk-2".to_vec(),
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        );
+        assert_eq!(
+            action,
+            PasteAction::ReplaceTail {
+                drop: 2,
+                append: b"abcd".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn paste_action_auth_then_auth_different_treats_as_new_paste() {
+        // Clipboard content actually changed within the window (the
+        // vanishingly-rare "two intentional pastes" case where the
+        // user copied something else in between). Honor it.
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let prev = auth(b"abcd", t0);
+        let (action, _state) = decide_paste_action(
+            Some(&prev),
+            Some(b"xyz".to_vec()),
+            b"chunk-2".to_vec(),
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        );
+        assert_eq!(action, PasteAction::Append(b"xyz".to_vec()));
+    }
+
+    #[test]
+    fn paste_action_fail_then_auth_unrelated_treats_as_new_paste() {
+        // Fallback baseline "ab", arboard returns "xyz" which neither
+        // starts nor ends with "ab" → treat as new paste rather than
+        // mangling the previous one.
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let prev = fallback(b"ab", t0);
+        let (action, _state) = decide_paste_action(
+            Some(&prev),
+            Some(b"xyz".to_vec()),
+            b"chunk-2".to_vec(),
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        );
+        assert_eq!(action, PasteAction::Append(b"xyz".to_vec()));
+    }
+
+    #[test]
+    fn paste_action_fail_then_fail_keeps_accumulating() {
+        // arboard broken on the host: fallback baseline + fallback chunk
+        // → keep accumulating, preserve Fallback marker so a later
+        // success can still supersede via ReplaceTail.
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let prev = fallback(b"ab", t0);
+        let (action, state) = decide_paste_action(
+            Some(&prev),
+            None,
+            b"cd".to_vec(),
+            t1,
+            PASTE_CHUNK_DEDUP_WINDOW,
+        );
+        assert_eq!(action, PasteAction::Append(b"cd".to_vec()));
+        let s = state.unwrap();
+        assert_eq!(s.baseline, b"abcd");
+        assert_eq!(s.appended_len, 4);
+        assert_eq!(s.source, PasteSource::Fallback);
+    }
+
+    #[test]
+    fn paste_action_after_window_expiry_treats_as_fresh_paste() {
+        // > window → ignore prev and treat as a fresh paste.
         let t0 = std::time::Instant::now();
         let t1 = t0 + PASTE_CHUNK_DEDUP_WINDOW + std::time::Duration::from_millis(10);
-        let prev = (b"hello world".to_vec(), t0);
-        assert!(!paste_event_is_chunk_dup(
+        let prev = auth(b"abcd", t0);
+        let (action, state) = decide_paste_action(
             Some(&prev),
-            b"hello world",
+            Some(b"abcd".to_vec()),
+            b"chunk-2".to_vec(),
             t1,
             PASTE_CHUNK_DEDUP_WINDOW,
-        ));
+        );
+        // Not Skip — treated as a brand-new paste.
+        assert_eq!(action, PasteAction::Append(b"abcd".to_vec()));
+        assert_eq!(state.unwrap().appended_len, 4);
     }
 
     #[test]
-    fn paste_chunk_dup_returns_false_for_different_content() {
-        // Content differs → not a chunk; honor the new paste even within
-        // the dedup window (handles the case where the user copied
-        // different content and immediately pasted it).
-        let t0 = std::time::Instant::now();
-        let t1 = t0 + std::time::Duration::from_millis(5);
-        let prev = (b"old".to_vec(), t0);
-        assert!(!paste_event_is_chunk_dup(
-            Some(&prev),
-            b"new",
-            t1,
-            PASTE_CHUNK_DEDUP_WINDOW,
-        ));
-    }
-
-    #[test]
-    fn paste_chunk_dup_window_boundary_is_exclusive() {
-        // `< window` — exactly at the boundary is *not* a duplicate.
+    fn paste_action_window_boundary_is_exclusive() {
+        // Match the original predicate behaviour: exactly at the
+        // boundary is *not* a duplicate.
         let t0 = std::time::Instant::now();
         let t1 = t0 + PASTE_CHUNK_DEDUP_WINDOW;
-        let prev = (b"x".to_vec(), t0);
-        assert!(!paste_event_is_chunk_dup(
+        let prev = auth(b"x", t0);
+        let (action, _state) = decide_paste_action(
             Some(&prev),
-            b"x",
+            Some(b"x".to_vec()),
+            b"x".to_vec(),
             t1,
             PASTE_CHUNK_DEDUP_WINDOW,
-        ));
+        );
+        assert_eq!(action, PasteAction::Append(b"x".to_vec()));
     }
 }
