@@ -1081,6 +1081,25 @@ fn feedback_worker_results(
 /// steady-state runs are free. On mismatch, writes via
 /// `SavedSession::save(ui.workspace)` (or `clear` when the snapshot is
 /// empty) and updates `last_saved_session` on success.
+/// Decide what UI updates an auto-save error should produce.
+///
+/// Returns `Some(message)` when this is the first time the user has
+/// been informed about *this exact* error; `None` when the same error
+/// has already been recorded (avoids spamming the status bar every
+/// frame on a persistent failure like disk full).
+///
+/// Split out from `auto_save_workspace` so the dedup contract is unit
+/// testable without needing a full `UiState` / `SharedState` harness.
+fn classify_auto_save_error(err: &str, existing_warnings: &[String]) -> Option<String> {
+    let message = format!("Workspace auto-save failed: {err}");
+    if existing_warnings.iter().any(|w| w == &message) {
+        None
+    } else {
+        Some(message)
+    }
+}
+
+/// Auto-save the current workspace if it changed since the last save.
 fn auto_save_workspace(ui: &mut UiState, state: &SharedState) {
     let live_panes = state.blocking_read().managed_pane_ids.clone();
     let current =
@@ -1099,16 +1118,23 @@ fn auto_save_workspace(ui: &mut UiState, state: &SharedState) {
             ui.last_saved_session = Some(current);
         }
         Err(e) => {
-            // Surface once, then suppress further messages from the same
-            // failed write to avoid filling the status bar every frame.
-            let warning = format!("Workspace auto-save failed: {e}");
-            let already_warned = ui
-                .session_warnings
-                .last()
-                .map(|w| w == &warning)
-                .unwrap_or(false);
-            if !already_warned {
-                ui.session_warnings.push(warning);
+            // Surface auto-save failures in two places so the user
+            // actually sees them — previously this only pushed to
+            // `session_warnings`, which is flushed to stderr at exit
+            // and is invisible during the session itself.
+            //
+            // 1. `status_message` — the dashboard footer renders this
+            //    for `STATUS_MESSAGE_TTL` so the user sees the failure
+            //    live.
+            // 2. `session_warnings` — flushed to stderr on exit so the
+            //    error is preserved if the user misses the live status.
+            //
+            // Each distinct failure is recorded at most once per
+            // session so a persistent error (disk full, permissions,
+            // etc.) doesn't flood the UI every frame.
+            if let Some(message) = classify_auto_save_error(&e, &ui.session_warnings) {
+                ui.status_message = Some((message.clone(), std::time::Instant::now()));
+                ui.session_warnings.push(message);
             }
         }
     }
@@ -9120,5 +9146,54 @@ mod tests {
             strip_paste_trailing_newlines_bytes(b"\xff\xfe\n"),
             b"\xff\xfe"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-save error classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_auto_save_error_returns_message_on_first_occurrence() {
+        // First time we hit a given error, we want to surface it to the
+        // user — both as a transient status message and as a recorded
+        // warning for exit-time replay.
+        let result = classify_auto_save_error("disk full", &[]);
+        assert_eq!(
+            result.as_deref(),
+            Some("Workspace auto-save failed: disk full")
+        );
+    }
+
+    #[test]
+    fn classify_auto_save_error_dedups_against_same_message() {
+        // Repeated identical failures must not spam the status bar every
+        // frame — once the user has seen the message, suppress it until
+        // the *kind* of error changes.
+        let existing = vec!["Workspace auto-save failed: disk full".to_string()];
+        assert!(classify_auto_save_error("disk full", &existing).is_none());
+    }
+
+    #[test]
+    fn classify_auto_save_error_surfaces_distinct_error_after_other_recorded() {
+        // A different error message (e.g., transient disk-full clears,
+        // then permission denied) is a distinct failure and must
+        // surface again.
+        let existing = vec!["Workspace auto-save failed: disk full".to_string()];
+        assert_eq!(
+            classify_auto_save_error("permission denied", &existing).as_deref(),
+            Some("Workspace auto-save failed: permission denied")
+        );
+    }
+
+    #[test]
+    fn classify_auto_save_error_dedups_even_when_not_most_recent() {
+        // Defense against the user adding unrelated warnings to
+        // `session_warnings` in between — the dedup must scan the full
+        // list, not just the last entry.
+        let existing = vec![
+            "Workspace auto-save failed: disk full".to_string(),
+            "Some unrelated warning".to_string(),
+        ];
+        assert!(classify_auto_save_error("disk full", &existing).is_none());
     }
 }

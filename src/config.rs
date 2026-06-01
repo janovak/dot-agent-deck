@@ -424,6 +424,16 @@ impl SavedSession {
 
     /// Write the session to the given workspace's file (or the default
     /// unnamed session when `workspace` is `None`).
+    ///
+    /// The write is atomic via the standard temp-file-and-rename pattern:
+    /// the contents land in `<path>.tmp` first and only then replace the
+    /// real file via `std::fs::rename`. Without this, a crash or
+    /// disk-full error mid-`std::fs::write` would leave the workspace file
+    /// truncated to zero bytes (since `fs::write` opens with `truncate(true)`
+    /// before writing). Atomic rename is guaranteed by both Unix and Windows
+    /// when source and destination live on the same filesystem — which they
+    /// always do here because the temp file is constructed by appending
+    /// `.tmp` to the final path.
     pub fn save(&self, workspace: Option<&str>) -> Result<(), String> {
         let path = workspace_session_path(workspace)?;
         if let Some(parent) = path.parent() {
@@ -432,8 +442,28 @@ impl SavedSession {
         }
         let contents = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize session: {e}"))?;
-        std::fs::write(&path, contents)
-            .map_err(|e| format!("Failed to write session at {}: {e}", path.display()))
+
+        let tmp_path = {
+            let mut s = path.clone().into_os_string();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+        std::fs::write(&tmp_path, contents).map_err(|e| {
+            format!(
+                "Failed to write session temp file at {}: {e}",
+                tmp_path.display()
+            )
+        })?;
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            // Best-effort cleanup so a failed rename doesn't leave a stray
+            // `.tmp` sibling around. The cleanup error is intentionally
+            // ignored — the rename failure is the real story.
+            let _ = std::fs::remove_file(&tmp_path);
+            format!(
+                "Failed to atomically replace session at {}: {e}",
+                path.display()
+            )
+        })
     }
 
     /// Delete the saved session file for the given workspace.
@@ -1061,6 +1091,105 @@ on_idle = true
         assert!(!delete_workspace("transient").unwrap());
 
         // SAFETY: restore env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_WORKSPACES", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_WORKSPACES"),
+            }
+        }
+    }
+
+    #[test]
+    fn save_is_atomic_via_temp_rename() {
+        // Regression guard: a successful save() must leave no `.tmp` file
+        // behind. Earlier implementations used `fs::write` directly, which
+        // is non-atomic — a crash between truncate and write would leave a
+        // zero-byte workspace file. The fix writes to `<path>.tmp` then
+        // `rename`s on top of the real path; if either step fails the tmp
+        // file should be cleaned up.
+        let _guard = WORKSPACES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("DOT_AGENT_DECK_WORKSPACES").ok();
+        // SAFETY: test is single-threaded.
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_WORKSPACES", dir.path().to_str().unwrap());
+        }
+
+        let session = SavedSession {
+            panes: vec![SavedPane {
+                dir: "/tmp/proj".to_string(),
+                name: "proj".to_string(),
+                command: "claude".to_string(),
+                mode: None,
+            }],
+        };
+        session.save(Some("atomic")).unwrap();
+
+        // The real file should exist with full contents.
+        let real_path = dir.path().join("atomic.toml");
+        assert!(real_path.is_file(), "real workspace file must exist");
+        let loaded = SavedSession::load(Some("atomic"));
+        assert_eq!(loaded.panes.len(), 1);
+
+        // No leftover `.tmp` sibling.
+        let tmp_path = dir.path().join("atomic.toml.tmp");
+        assert!(
+            !tmp_path.exists(),
+            "temp file should have been renamed away, not left behind"
+        );
+
+        // Saving again over an existing file (with new content) still
+        // ends up atomic.
+        let session2 = SavedSession {
+            panes: vec![
+                SavedPane {
+                    dir: "/a".to_string(),
+                    name: "a".to_string(),
+                    command: "claude".to_string(),
+                    mode: None,
+                },
+                SavedPane {
+                    dir: "/b".to_string(),
+                    name: "b".to_string(),
+                    command: "opencode".to_string(),
+                    mode: None,
+                },
+            ],
+        };
+        session2.save(Some("atomic")).unwrap();
+        let loaded = SavedSession::load(Some("atomic"));
+        assert_eq!(loaded.panes.len(), 2);
+        assert!(!tmp_path.exists());
+
+        // SAFETY: restore env var.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_WORKSPACES", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_WORKSPACES"),
+            }
+        }
+    }
+
+    #[test]
+    fn save_does_not_corrupt_existing_file_when_target_dir_was_just_created() {
+        // The save() path creates parent dirs on demand. Verify that the
+        // temp-then-rename still works when the parent didn't exist before.
+        let _guard = WORKSPACES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let outer = tempfile::tempdir().unwrap();
+        let nested = outer.path().join("does/not/exist/yet");
+        let prev = std::env::var("DOT_AGENT_DECK_WORKSPACES").ok();
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_WORKSPACES", nested.to_str().unwrap());
+        }
+
+        SavedSession::default().save(Some("freshdir")).unwrap();
+        assert!(nested.join("freshdir.toml").is_file());
+        assert!(!nested.join("freshdir.toml.tmp").exists());
+
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("DOT_AGENT_DECK_WORKSPACES", v),
