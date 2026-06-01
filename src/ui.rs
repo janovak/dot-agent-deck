@@ -1960,6 +1960,22 @@ fn open_bookmark_note_modal(
         ));
         return;
     }
+    // Refuse to bookmark the dot-agent-deck placeholder ID (`pane-N`)
+    // that we use before the agent fires its first SessionStart. Saving
+    // it would later spawn `copilot --resume pane-N`, which the agent
+    // doesn't recognise (it knows nothing about our placeholders) and
+    // would fail with "No session, task, or name matched 'pane-N'".
+    // The user just needs to send the agent any prompt first so the
+    // real session ID flows back through the hook.
+    if session_id.starts_with("pane-") {
+        ui.status_message = Some((
+            "Send the agent a prompt first so it has a real session ID — \
+             then Ctrl+B will bookmark a resumable session."
+                .to_string(),
+            std::time::Instant::now(),
+        ));
+        return;
+    }
 
     // Look up the human-readable name. Try Copilot's DB first when relevant;
     // otherwise fall back to the first prompt we've seen in the conversation.
