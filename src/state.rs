@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config_validation::sanitize_role_name;
 use crate::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
@@ -462,26 +462,74 @@ impl AppState {
                 session.status,
                 SessionStatus::Working | SessionStatus::Thinking
             ) {
+                // Other statuses are by design ineligible (Idle, Pending
+                // itself, WaitingForInput, Compacting, Error). Skipping
+                // silently — those are the common case, no diagnostic
+                // value in logging them.
                 continue;
             }
+            // Compute elapsed early so we can include it in skip logs.
+            let elapsed = now.signed_duration_since(session.last_activity);
+            let elapsed_ms = elapsed.num_milliseconds();
+
             if session.active_tool.is_some() {
+                // A diagnostic for the user-reported "Pending never fires"
+                // case. The most common explanation in real-world Copilot
+                // CLI usage is that a tool is running back-to-back, so the
+                // Working+no-tool window is too brief for the timeout to
+                // elapse. Logging the active tool name + how long the gate
+                // would have needed makes that observable.
+                info!(
+                    session_id = %sid,
+                    status = ?session.status,
+                    elapsed_ms,
+                    active_tool = %session.active_tool.as_ref().map(|t| t.name.as_str()).unwrap_or("?"),
+                    "pending_check skipped: active_tool"
+                );
                 continue;
             }
             // Background subagents are legitimate work — don't false-positive
             // them into Pending. The parent agent simply hasn't fired events
             // because it's waiting on subagents to finish.
             if session.active_subagent_count > 0 {
+                info!(
+                    session_id = %sid,
+                    status = ?session.status,
+                    elapsed_ms,
+                    subagent_count = session.active_subagent_count,
+                    "pending_check skipped: active subagents"
+                );
                 continue;
             }
-            let elapsed = now.signed_duration_since(session.last_activity);
             // Reject negative (clock went backward) and absurdly large
             // values (clock jumped forward — sleep/NTP/manual change).
             if elapsed < chrono::Duration::zero() || elapsed > CLOCK_SKEW_REJECTION_THRESHOLD {
+                info!(
+                    session_id = %sid,
+                    status = ?session.status,
+                    elapsed_ms,
+                    "pending_check skipped: clock skew rejected"
+                );
                 continue;
             }
             if elapsed >= timeout {
+                info!(
+                    session_id = %sid,
+                    from_status = ?session.status,
+                    elapsed_ms,
+                    timeout_ms = timeout.num_milliseconds(),
+                    "pending_check fired: transitioning to Pending"
+                );
                 session.status = SessionStatus::Pending;
                 transitioned.push(sid.clone());
+            } else {
+                info!(
+                    session_id = %sid,
+                    status = ?session.status,
+                    elapsed_ms,
+                    timeout_ms = timeout.num_milliseconds(),
+                    "pending_check waiting: eligible but below timeout"
+                );
             }
         }
         transitioned
