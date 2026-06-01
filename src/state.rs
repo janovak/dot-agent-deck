@@ -123,7 +123,7 @@ impl AppState {
 
     /// Create a placeholder session for a newly created pane so it always has a dashboard card.
     pub fn insert_placeholder_session(&mut self, pane_id: String, cwd: Option<String>) {
-        let session_id = format!("pane-{}", pane_id);
+        let session_id = placeholder_session_id(&pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
         self.sessions.insert(
@@ -236,9 +236,36 @@ impl AppState {
                     .then(|| id.clone())
             })
         {
-            let old_id = std::mem::replace(&mut event.session_id, existing_id);
-            if old_id != event.session_id {
-                self.sessions.remove(&old_id);
+            // Two cases:
+            //
+            //  A) `existing_id` is a placeholder (`"pane-<n>"`) we
+            //     inserted via `insert_placeholder_session` before the
+            //     agent's first hook arrived, and `event.session_id`
+            //     is the agent's real session ID (e.g., a Copilot CLI
+            //     UUID). PROMOTE: re-key the session under the real
+            //     ID so downstream features like Session Bookmarks
+            //     see the right ID. Without this, the placeholder
+            //     "pane-3" persists forever and `copilot --resume
+            //     pane-3` later fails because Copilot doesn't know
+            //     that string.
+            //
+            //  B) Both IDs are "real" — a session restart on the same
+            //     pane (e.g., Claude Code `/restart`). Keep the
+            //     existing key by rewriting the event so the card
+            //     stays in place across the restart. Same behavior
+            //     as before.
+            if is_placeholder_session_id(&existing_id)
+                && !is_placeholder_session_id(&event.session_id)
+            {
+                if let Some(mut moved) = self.sessions.remove(&existing_id) {
+                    moved.session_id = event.session_id.clone();
+                    self.sessions.insert(event.session_id.clone(), moved);
+                }
+            } else {
+                let old_id = std::mem::replace(&mut event.session_id, existing_id);
+                if old_id != event.session_id {
+                    self.sessions.remove(&old_id);
+                }
             }
         }
 
@@ -578,6 +605,29 @@ fn is_interactive_prompt_tool(name: &str) -> bool {
         .iter()
         .any(|known| name.eq_ignore_ascii_case(known))
 }
+
+/// Build the dot-agent-deck placeholder session ID for a given pane.
+/// Centralised here so the format stays in lockstep with the
+/// `is_placeholder_session_id` checker below.
+fn placeholder_session_id(pane_id: &str) -> String {
+    format!("{PLACEHOLDER_SESSION_ID_PREFIX}{pane_id}")
+}
+
+/// Returns true when `id` looks like a placeholder session ID inserted
+/// by `insert_placeholder_session` (i.e., not a real agent-assigned
+/// session ID like a Copilot CLI UUID).
+///
+/// Used by the pane-id-based session-merge logic in `apply_event` so a
+/// late-arriving agent SessionStart can *promote* an existing
+/// placeholder card to the real session ID — without the promotion,
+/// the placeholder string (`"pane-3"`, etc.) would persist as the
+/// canonical session_id forever and downstream features like Session
+/// Bookmarks would store unusable IDs.
+fn is_placeholder_session_id(id: &str) -> bool {
+    id.starts_with(PLACEHOLDER_SESSION_ID_PREFIX)
+}
+
+const PLACEHOLDER_SESSION_ID_PREFIX: &str = "pane-";
 
 #[cfg(test)]
 mod tests {
@@ -1066,11 +1116,19 @@ mod tests {
         // Key is "pane-pane-42" because pane_id="pane-42" and placeholder keys use "pane-{pane_id}".
         assert!(state.sessions.contains_key("pane-pane-42"));
 
-        // New session on the same pane reuses the placeholder key and keeps started_at.
+        // New session on the same pane: the placeholder is promoted to
+        // the real session ID ("s2"). started_at is preserved across
+        // the transition because the placeholder copied it from
+        // `pane_started_at`, and apply_event keeps that field when
+        // it upgrades a session.
         let mut ev2 = make_event("s2", EventType::SessionStart);
         ev2.pane_id = Some("pane-42".to_string());
         state.apply_event(ev2);
-        assert_eq!(state.sessions["pane-pane-42"].started_at, original_started);
+        assert!(
+            !state.sessions.contains_key("pane-pane-42"),
+            "placeholder should be promoted to the real session ID"
+        );
+        assert_eq!(state.sessions["s2"].started_at, original_started);
     }
 
     #[test]
@@ -1120,10 +1178,13 @@ mod tests {
         start.cwd = Some("/home".to_string());
         state.apply_event(start);
 
-        // Placeholder key is reused, real UUID key is removed
-        assert!(state.sessions.contains_key("pane-42"));
-        assert!(!state.sessions.contains_key("real-uuid-123"));
-        let session = &state.sessions["pane-42"];
+        // Real UUID becomes the canonical key (promoted from placeholder)
+        // so downstream features like Session Bookmarks store an ID that
+        // the agent CLI's own --resume command can actually consume.
+        assert!(state.sessions.contains_key("real-uuid-123"));
+        assert!(!state.sessions.contains_key("pane-42"));
+        let session = &state.sessions["real-uuid-123"];
+        assert_eq!(session.session_id, "real-uuid-123");
         assert_eq!(session.agent_type, AgentType::ClaudeCode);
         assert_eq!(session.cwd.as_deref(), Some("/home"));
         assert_eq!(session.pane_id.as_deref(), Some("42"));
@@ -1135,18 +1196,22 @@ mod tests {
         state.register_pane("42".to_string());
         state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
 
-        // Transition to real session
+        // Transition to real session (placeholder is promoted away)
         let mut start = make_event("real-uuid", EventType::SessionStart);
         start.pane_id = Some("42".to_string());
         state.apply_event(start);
-        assert_eq!(state.sessions["pane-42"].agent_type, AgentType::ClaudeCode);
+        assert_eq!(
+            state.sessions["real-uuid"].agent_type,
+            AgentType::ClaudeCode
+        );
 
         // End the real session — placeholder should be restored
-        let mut end = make_event("pane-42", EventType::SessionEnd);
+        let mut end = make_event("real-uuid", EventType::SessionEnd);
         end.pane_id = Some("42".to_string());
         state.apply_event(end);
 
         assert!(state.sessions.contains_key("pane-42"));
+        assert!(!state.sessions.contains_key("real-uuid"));
         assert_eq!(state.sessions["pane-42"].agent_type, AgentType::None);
         assert_eq!(state.sessions["pane-42"].pane_id.as_deref(), Some("42"));
     }
@@ -1157,13 +1222,13 @@ mod tests {
         state.register_pane("42".to_string());
         state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
 
-        // Transition to real session
+        // Transition to real session (placeholder promoted to real UUID)
         let mut start = make_event("real-uuid", EventType::SessionStart);
         start.pane_id = Some("42".to_string());
         state.apply_event(start);
 
         // Simulate Ctrl+w: remove session and unregister pane (same as ui handler)
-        state.sessions.remove("pane-42");
+        state.sessions.remove("real-uuid");
         state.unregister_pane("42");
 
         assert!(state.sessions.is_empty());
@@ -1199,6 +1264,80 @@ mod tests {
 
         assert!(state.sessions.is_empty());
         assert!(!state.managed_pane_ids.contains("42"));
+    }
+
+    #[test]
+    fn placeholder_promotion_preserves_real_uuid_for_bookmarks() {
+        // Regression guard for the user-reported "Error: No session, task,
+        // or name matched 'pane-3'" bookmark-resume failure. The bookmark
+        // feature reads `SessionState::session_id` and saves it to disk;
+        // later `copilot --resume <id>` consumes that string. If the
+        // promotion logic ever regresses and leaves the placeholder
+        // string as the canonical session_id, every bookmark created
+        // before the agent's first hook will be unresumable.
+        let mut state = AppState::default();
+        state.register_pane("3".to_string());
+        state.insert_placeholder_session("3".to_string(), Some("/repo".to_string()));
+
+        // Agent finally fires SessionStart with a real UUID.
+        let real_uuid = "fe179f3b-5594-4ff0-9f05-94ad962db12f";
+        let mut start = make_event(real_uuid, EventType::SessionStart);
+        start.agent_type = AgentType::CopilotCli;
+        start.pane_id = Some("3".to_string());
+        state.apply_event(start);
+
+        // The dashboard's view of this session — what
+        // `open_bookmark_note_modal` reads — must now be the real UUID,
+        // not the placeholder.
+        let session = state
+            .sessions
+            .get(real_uuid)
+            .expect("session should be keyed by real UUID after promotion");
+        assert_eq!(
+            session.session_id, real_uuid,
+            "SessionState.session_id must also be the real UUID, not the placeholder"
+        );
+        assert!(
+            !state.sessions.contains_key("pane-3"),
+            "placeholder must be removed once promoted"
+        );
+    }
+
+    #[test]
+    fn real_to_real_session_restart_keeps_existing_key() {
+        // The promotion path is *only* for placeholder → real. A real
+        // → real restart (e.g., Claude Code `/restart`) must still
+        // collapse the new session into the existing key so the card
+        // stays in place and any user-set display name is preserved.
+        let mut state = AppState::default();
+        state.register_pane("7".to_string());
+
+        let mut first = make_event("real-uuid-A", EventType::SessionStart);
+        first.pane_id = Some("7".to_string());
+        state.apply_event(first);
+        assert!(state.sessions.contains_key("real-uuid-A"));
+
+        let mut restart = make_event("real-uuid-B", EventType::SessionStart);
+        restart.pane_id = Some("7".to_string());
+        state.apply_event(restart);
+
+        // The new session collapses into the existing key — same as
+        // pre-fix behavior. We don't churn the key on every restart.
+        assert!(state.sessions.contains_key("real-uuid-A"));
+        assert!(!state.sessions.contains_key("real-uuid-B"));
+    }
+
+    #[test]
+    fn is_placeholder_session_id_recognises_placeholders() {
+        assert!(is_placeholder_session_id("pane-1"));
+        assert!(is_placeholder_session_id("pane-42"));
+        assert!(is_placeholder_session_id("pane-abc"));
+        // Real Copilot UUIDs and other agent IDs do NOT start with "pane-".
+        assert!(!is_placeholder_session_id(
+            "fe179f3b-5594-4ff0-9f05-94ad962db12f"
+        ));
+        assert!(!is_placeholder_session_id("real-uuid"));
+        assert!(!is_placeholder_session_id(""));
     }
 
     #[test]
