@@ -457,6 +457,12 @@ impl NewPaneFormState {
 /// transient info messages don't linger past their usefulness.
 const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Maximum character count for a bookmark note. Caps runaway pastes or
+/// stuck-key input from growing `UiState::bookmark_note_input` without
+/// bound while still leaving plenty of room for the intended use case
+/// (short labels like "auth bug investigation").
+const BOOKMARK_NOTE_MAX_CHARS: usize = 512;
+
 /// A prompt queued for injection into a pane once its agent is ready.
 /// Used by M5 delegation dispatch when `clear = true` restarts a pane.
 struct PendingDispatch {
@@ -2034,7 +2040,10 @@ fn handle_bookmark_note_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
         KeyCode::Backspace => {
             ui.bookmark_note_input.pop();
         }
-        KeyCode::Char(c) => {
+        // Defensive cap so a runaway paste or held key doesn't grow
+        // the note input without bound. 512 chars is plenty for the
+        // intended "short label" use case while leaving safe headroom.
+        KeyCode::Char(c) if ui.bookmark_note_input.chars().count() < BOOKMARK_NOTE_MAX_CHARS => {
             ui.bookmark_note_input.push(c);
         }
         _ => {}
@@ -3582,11 +3591,29 @@ pub fn run_tui(
                         shortcut_handled = true;
                     }
                     // Ctrl+B: bookmark the currently selected card's session
+                    // Ctrl+B: bookmark the currently-selected card's session
                     // (opens a note input modal). Ctrl+Shift+B: open the
                     // bookmark picker. On most terminals + crossterm,
                     // Ctrl+Shift+letter delivers the uppercase char with
                     // both CONTROL and SHIFT modifiers set.
-                    KeyCode::Char(c) if c.eq_ignore_ascii_case(&'b') => {
+                    //
+                    // Mode guard: skip when an editable modal already owns
+                    // the keyboard, otherwise Ctrl+B inside the bookmark-note
+                    // editor would re-open the modal and clobber the
+                    // user's in-flight input.
+                    KeyCode::Char(c)
+                        if c.eq_ignore_ascii_case(&'b')
+                            && !matches!(
+                                ui.mode,
+                                UiMode::BookmarkNote
+                                    | UiMode::BookmarkPicker
+                                    | UiMode::Rename
+                                    | UiMode::Filter
+                                    | UiMode::NewPaneForm
+                                    | UiMode::ConfigGenPrompt
+                                    | UiMode::DirPicker
+                            ) =>
+                    {
                         if key.modifiers.contains(KeyModifiers::SHIFT) || c.is_ascii_uppercase() {
                             // Ctrl+Shift+B → picker.
                             ui.bookmarks = crate::bookmark::load();
@@ -9864,5 +9891,47 @@ mod tests {
             "Some unrelated warning".to_string(),
         ];
         assert!(classify_auto_save_error("disk full", &existing).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Bookmark note input length cap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bookmark_note_input_caps_at_max_chars() {
+        // Defensive cap: a runaway paste or stuck-key should not let
+        // `bookmark_note_input` grow without bound. The cap is
+        // BOOKMARK_NOTE_MAX_CHARS chars (counting Unicode characters,
+        // not bytes), reached by repeated KeyCode::Char events.
+        let mut ui = default_ui();
+        ui.mode = UiMode::BookmarkNote;
+        for _ in 0..(BOOKMARK_NOTE_MAX_CHARS + 50) {
+            let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+            let _ = handle_bookmark_note_key(key, &mut ui);
+        }
+        assert_eq!(
+            ui.bookmark_note_input.chars().count(),
+            BOOKMARK_NOTE_MAX_CHARS,
+            "input must clamp at the configured maximum"
+        );
+        // And the next char is still rejected, not panicking.
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let _ = handle_bookmark_note_key(key, &mut ui);
+        assert_eq!(
+            ui.bookmark_note_input.chars().count(),
+            BOOKMARK_NOTE_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn bookmark_note_input_under_cap_still_accepts_chars() {
+        // Sanity: the cap doesn't break normal short notes.
+        let mut ui = default_ui();
+        ui.mode = UiMode::BookmarkNote;
+        for c in "auth bug investigation".chars() {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            let _ = handle_bookmark_note_key(key, &mut ui);
+        }
+        assert_eq!(ui.bookmark_note_input, "auth bug investigation");
     }
 }

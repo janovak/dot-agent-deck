@@ -73,7 +73,13 @@ pub fn save(list: &[Bookmark]) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, contents)
         .map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to commit bookmarks file: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        // Best-effort cleanup so a failed rename doesn't leave a stray
+        // `.tmp` sibling around. Same pattern as workspace save in
+        // `config::SavedSession::save`.
+        let _ = std::fs::remove_file(&tmp);
+        format!("Failed to commit bookmarks file: {e}")
+    })?;
     Ok(())
 }
 
@@ -427,5 +433,30 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+    }
+
+    #[test]
+    fn save_does_not_leave_orphan_tmp_file_on_success() {
+        // Regression guard: a successful save() must leave no `.tmp`
+        // sibling. Earlier implementations didn't clean up on rename
+        // failure; we want the happy path to never leave one either.
+        let _guard = BOOKMARKS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bookmarks.json");
+        let prev = setup_env(&path);
+
+        save(&[sample("aaaa-1111", "first")]).unwrap();
+        assert!(path.is_file(), "bookmarks file must exist");
+        let tmp = path.with_extension("json.tmp");
+        assert!(
+            !tmp.exists(),
+            "tmp sibling must not exist after successful save"
+        );
+
+        // Overwrite path (existing file) — still no tmp left behind.
+        save(&[sample("bbbb-2222", "second")]).unwrap();
+        assert!(!tmp.exists());
+
+        restore_env(prev);
     }
 }
