@@ -331,7 +331,19 @@ impl AppState {
                 // subagents and is now waiting on them — without this guard
                 // the card would mislead the user into thinking nothing is
                 // happening.
-                if session.active_subagent_count > 0 {
+                //
+                // `WaitingForInput` and `Error` are "sticky" — they reflect
+                // attention the user still needs to give. An Idle event
+                // ending the parent turn must not silently clobber either
+                // state (which would hide a permission prompt or an error).
+                // The next genuine transition (ToolStart for WaitingForInput,
+                // a new Thinking for Error) is responsible for clearing it.
+                if matches!(
+                    session.status,
+                    SessionStatus::WaitingForInput | SessionStatus::Error
+                ) {
+                    // Don't touch status; still clear active_tool below.
+                } else if session.active_subagent_count > 0 {
                     session.status = SessionStatus::Working;
                 } else {
                     session.status = SessionStatus::Idle;
@@ -356,6 +368,13 @@ impl AppState {
                 }
             }
             EventType::SubagentStop => {
+                // Track whether saturating_sub actually decremented — a
+                // spurious Stop (e.g., duplicated hook event, or a Stop
+                // arriving without a preceding Start) must not be allowed
+                // to flip a legitimately-Working session to Idle, because
+                // that case is exactly the "stuck at non-hook prompt"
+                // scenario the Pending heuristic is designed to catch.
+                let count_actually_decreased = session.active_subagent_count > 0;
                 session.active_subagent_count = session.active_subagent_count.saturating_sub(1);
                 // If the parent's last `Idle` event was deferred to Working
                 // because subagents were in flight, the card can return to
@@ -363,7 +382,8 @@ impl AppState {
                 // tool is currently running and no fresh non-subagent event
                 // has nudged the status elsewhere (Thinking, WaitingForInput,
                 // etc., all stay put).
-                if session.active_subagent_count == 0
+                if count_actually_decreased
+                    && session.active_subagent_count == 0
                     && session.active_tool.is_none()
                     && session.status == SessionStatus::Working
                 {
@@ -1429,6 +1449,104 @@ mod tests {
         let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert!(transitioned.is_empty());
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn idle_event_preserves_waiting_for_input_even_with_subagents() {
+        // Bug guard: a permission prompt (WaitingForInput) must survive an
+        // Idle event arriving from the parent agent's turn-end. Before the
+        // fix, the Idle handler unconditionally flipped status to
+        // Working (when subagents were active) or Idle (when not),
+        // silently hiding the prompt from the user. Test both subagent
+        // count > 0 and count == 0 branches.
+        for subagent_count in [0u32, 2] {
+            let mut state = AppState::default();
+            state.register_pane("p1".into());
+            state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+            state.sessions.get_mut("s1").unwrap().status = SessionStatus::WaitingForInput;
+            state.sessions.get_mut("s1").unwrap().active_subagent_count = subagent_count;
+            state.apply_event(make_event_with_pane("s1", EventType::Idle, "p1"));
+            assert_eq!(
+                state.sessions["s1"].status,
+                SessionStatus::WaitingForInput,
+                "WaitingForInput must survive Idle (subagent_count = {subagent_count})"
+            );
+            // Subagent count must be unchanged by an Idle event.
+            assert_eq!(state.sessions["s1"].active_subagent_count, subagent_count);
+        }
+    }
+
+    #[test]
+    fn idle_event_preserves_error_even_with_subagents() {
+        // Same sticky-status guard for Error: a session that surfaced an
+        // error must not have it silently buried by the parent agent's
+        // turn-end Idle event.
+        for subagent_count in [0u32, 2] {
+            let mut state = AppState::default();
+            state.register_pane("p1".into());
+            state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+            state.sessions.get_mut("s1").unwrap().status = SessionStatus::Error;
+            state.sessions.get_mut("s1").unwrap().active_subagent_count = subagent_count;
+            state.apply_event(make_event_with_pane("s1", EventType::Idle, "p1"));
+            assert_eq!(
+                state.sessions["s1"].status,
+                SessionStatus::Error,
+                "Error must survive Idle (subagent_count = {subagent_count})"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_event_clears_active_tool_even_when_status_is_sticky() {
+        // The Idle handler clears `active_tool` unconditionally — the
+        // sticky-status guard only protects the status field. Verify
+        // the side effect still happens so a stuck WaitingForInput
+        // pane doesn't keep showing an old tool detail.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("Bash".into());
+        state.apply_event(tool);
+        state.sessions.get_mut("s1").unwrap().status = SessionStatus::WaitingForInput;
+
+        state.apply_event(make_event_with_pane("s1", EventType::Idle, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::WaitingForInput);
+        assert!(
+            state.sessions["s1"].active_tool.is_none(),
+            "Idle must always clear active_tool"
+        );
+    }
+
+    #[test]
+    fn spurious_subagent_stop_does_not_flip_working_to_idle() {
+        // Regression guard for the spurious-Stop edge case: a SubagentStop
+        // arriving with no preceding Start (duplicated hook, out-of-order
+        // event) must not be allowed to flip a legitimately-Working
+        // session to Idle. That case is exactly the "stuck at non-hook
+        // prompt" scenario the Pending heuristic is designed to catch —
+        // silently resolving it via a phantom Stop would mask the bug
+        // the dashboard exists to surface.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        // Get into Working without ever firing SubagentStart.
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert_eq!(state.sessions["s1"].active_subagent_count, 0);
+
+        // Now fire a spurious Stop.
+        state.apply_event(make_event_with_pane("s1", EventType::SubagentStop, "p1"));
+        assert_eq!(
+            state.sessions["s1"].active_subagent_count, 0,
+            "saturating_sub keeps count pinned at zero"
+        );
+        assert_eq!(
+            state.sessions["s1"].status,
+            SessionStatus::Working,
+            "spurious Stop must not flip Working → Idle without a real Start having fired"
+        );
     }
 
     fn make_event_with_pane(session_id: &str, event_type: EventType, pane_id: &str) -> AgentEvent {
