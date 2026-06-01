@@ -1347,6 +1347,74 @@ fn screen_row_offset(screen: &vt100::Screen, pane_rect: Rect) -> u16 {
     effective_rows.saturating_sub(inner_h) as u16
 }
 
+/// Read one screen row as a String by walking its vt100 cells.
+/// Empty cells (no content) become single spaces so column indexes in the
+/// returned string correspond 1:1 to terminal columns. The vt100 crate doesn't
+/// expose a `row_text` accessor directly, so we synthesise it from `cell()`.
+fn read_screen_row_text(screen: &vt100::Screen, screen_row: u16) -> String {
+    let (_, cols) = screen.size();
+    let mut result = String::with_capacity(cols as usize);
+    for col in 0..cols {
+        if let Some(cell) = screen.cell(screen_row, col) {
+            let ch = cell.contents();
+            if ch.is_empty() {
+                result.push(' ');
+            } else {
+                result.push_str(ch);
+            }
+        } else {
+            result.push(' ');
+        }
+    }
+    result
+}
+
+/// Scan a screen-row text for a `http(s)://...` URL whose horizontal span
+/// covers `col` (column index, 0-based, matching the string's character
+/// offsets when each cell renders to exactly one char).
+///
+/// Returns the URL with trailing sentence-ending punctuation
+/// (`.,;:!?)]}>"'`) trimmed, since those characters are almost always
+/// part of the prose around the URL rather than the URL itself.
+///
+/// Used as a fallback when an agent prints URLs as plain text instead
+/// of wrapping them in OSC 8 hyperlink escapes. Copilot CLI commonly
+/// does this — the user's hyperlink-diagnostics probe confirmed the
+/// "no OSC 8 link on that row" branch was the hit case.
+fn extract_url_at_column(row_text: &str, col: u16) -> Option<String> {
+    static URL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = URL_RE.get_or_init(|| {
+        // Conservative URL pattern: scheme + non-whitespace, non-quote,
+        // non-bracket chars. Avoid `<>` so HTML-like contexts don't
+        // capture surrounding markup; avoid backticks so Markdown
+        // inline code doesn't include them.
+        regex::Regex::new(r#"https?://[^\s<>"`'(){}\[\]]+"#)
+            .expect("hard-coded URL regex must compile")
+    });
+    let col = col as usize;
+    let mut best: Option<(usize, usize, &str)> = None;
+    for m in re.find_iter(row_text) {
+        // `m.start()` and `m.end()` are byte offsets, which equal
+        // character offsets for ASCII URLs. Real-world URLs are
+        // virtually always ASCII; if a non-ASCII char snuck in we'd
+        // still get the right *containment* answer because the col
+        // is also in the same offset space (the row is built from
+        // single-char cells).
+        if col >= m.start() && col < m.end() {
+            best = Some((m.start(), m.end(), m.as_str()));
+            break;
+        }
+    }
+    let (_, _, raw) = best?;
+    // Trim trailing punctuation that's almost always prose, not URL.
+    let trimmed = raw.trim_end_matches(|c: char| ".,;:!?)]}>\"'".contains(c));
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Extract text from a vt100 screen for the given selection region.
 /// Selection coordinates are widget-relative; `row_offset` maps them to screen rows.
 fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offset: u16) -> String {
@@ -3130,29 +3198,57 @@ pub fn run_tui(
                                         && mouse.row < inner_y + inner_h
                                     {
                                         let row = mouse.row - inner_y;
-                                        if let Some(hmap_arc) = embedded.get_hyperlinks(&pane_id)
-                                            && let Ok(hmap) = hmap_arc.lock()
-                                            && let Some(screen_arc) = embedded.get_screen(&pane_id)
-                                            && let Ok(parser) = screen_arc.lock()
-                                        {
-                                            let offset = screen_row_offset(parser.screen(), rect);
-                                            let screen_row = row + offset;
-                                            if let Some(url) = hmap.get_row(screen_row) {
-                                                let url = url.to_string();
-                                                drop(parser);
-                                                drop(hmap);
-                                                if open::that(&url).is_ok() {
-                                                    let display = if url.len() > 60 {
-                                                        format!("{}...", &url[..57])
-                                                    } else {
-                                                        url
-                                                    };
-                                                    ui.status_message = Some((
-                                                        format!("Opened: {display}"),
-                                                        std::time::Instant::now(),
-                                                    ));
+                                        let col = mouse.column - inner_x;
+                                        // Two ways to find a URL at the
+                                        // clicked cell:
+                                        //
+                                        //  1. (preferred) OSC 8 hyperlink
+                                        //     map — what the agent
+                                        //     *explicitly* marked as a
+                                        //     link via the OSC 8 escape.
+                                        //  2. (fallback) regex scan of
+                                        //     the row text for plain
+                                        //     `http(s)://...`. Required
+                                        //     because Copilot CLI prints
+                                        //     URLs as plain text without
+                                        //     OSC 8 wrapping, so without
+                                        //     this fallback Ctrl+click
+                                        //     silently does nothing.
+                                        let url_to_open: Option<String> =
+                                            embedded.get_screen(&pane_id).and_then(|screen_arc| {
+                                                let parser = screen_arc.lock().ok()?;
+                                                let offset =
+                                                    screen_row_offset(parser.screen(), rect);
+                                                let screen_row = row + offset;
+                                                let osc8 = embedded
+                                                    .get_hyperlinks(&pane_id)
+                                                    .and_then(|h| {
+                                                        h.lock().ok().and_then(|m| {
+                                                            m.get_row(screen_row)
+                                                                .map(|u| u.to_string())
+                                                        })
+                                                    });
+                                                if osc8.is_some() {
+                                                    return osc8;
                                                 }
-                                            }
+                                                let row_text = read_screen_row_text(
+                                                    parser.screen(),
+                                                    screen_row,
+                                                );
+                                                extract_url_at_column(&row_text, col)
+                                            });
+                                        if let Some(url) = url_to_open
+                                            && open::that(&url).is_ok()
+                                        {
+                                            let display = if url.len() > 60 {
+                                                format!("{}...", &url[..57])
+                                            } else {
+                                                url
+                                            };
+                                            ui.status_message = Some((
+                                                format!("Opened: {display}"),
+                                                std::time::Instant::now(),
+                                            ));
                                         }
                                     }
                                 }
@@ -9952,5 +10048,92 @@ mod tests {
             let _ = handle_bookmark_note_key(key, &mut ui);
         }
         assert_eq!(ui.bookmark_note_input, "auth bug investigation");
+    }
+
+    // -----------------------------------------------------------------------
+    // Ctrl+click plain-text URL extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_url_basic_https() {
+        let row = "Visit https://example.com for more info";
+        // Column 10 is inside "https://example.com" (which spans 6..25).
+        assert_eq!(
+            extract_url_at_column(row, 10).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn extract_url_http() {
+        let row = "  http://localhost:8080/page  ";
+        assert_eq!(
+            extract_url_at_column(row, 5).as_deref(),
+            Some("http://localhost:8080/page")
+        );
+    }
+
+    #[test]
+    fn extract_url_strips_trailing_punctuation() {
+        // Regression: prose commonly ends URLs with sentence punctuation.
+        // The trailing `.` is NOT part of the URL.
+        let row = "See https://example.com.";
+        assert_eq!(
+            extract_url_at_column(row, 10).as_deref(),
+            Some("https://example.com")
+        );
+        // Same for comma, exclamation, paren-close, etc.
+        let row = "Try (https://example.com), or skip!";
+        assert_eq!(
+            extract_url_at_column(row, 10).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn extract_url_returns_none_when_click_is_outside_url_span() {
+        let row = "Click here: https://example.com please";
+        // Column 0 is in "Click" — no URL there.
+        assert!(extract_url_at_column(row, 0).is_none());
+        // Column 35 is past the URL (in "please").
+        assert!(extract_url_at_column(row, 35).is_none());
+    }
+
+    #[test]
+    fn extract_url_picks_the_url_under_the_clicked_column_with_two_urls_on_one_row() {
+        let row = "First https://a.example and second https://b.example end";
+        // Col 8 is inside the first URL (6..23).
+        assert_eq!(
+            extract_url_at_column(row, 8).as_deref(),
+            Some("https://a.example")
+        );
+        // Col 40 is inside the second URL (~35..52).
+        assert_eq!(
+            extract_url_at_column(row, 40).as_deref(),
+            Some("https://b.example")
+        );
+    }
+
+    #[test]
+    fn extract_url_returns_none_for_no_url() {
+        assert!(extract_url_at_column("just prose, nothing to click", 5).is_none());
+        assert!(extract_url_at_column("", 0).is_none());
+    }
+
+    #[test]
+    fn extract_url_does_not_match_bare_domain_without_scheme() {
+        // Conservative on purpose: `example.com` (no scheme) could be
+        // anything in prose. Only match when the user is unambiguously
+        // pointing at a URL.
+        assert!(extract_url_at_column("see example.com for details", 6).is_none());
+    }
+
+    #[test]
+    fn extract_url_handles_query_string_and_fragment() {
+        let row = "https://example.com/path?x=1&y=2#section";
+        assert_eq!(
+            extract_url_at_column(row, 5).as_deref(),
+            Some("https://example.com/path?x=1&y=2#section")
+        );
     }
 }
