@@ -1392,20 +1392,21 @@ fn extract_url_at_column(row_text: &str, col: u16) -> Option<String> {
             .expect("hard-coded URL regex must compile")
     });
     let col = col as usize;
-    let mut best: Option<(usize, usize, &str)> = None;
+    // `m.start()` / `m.end()` are byte offsets, but `col` is a column
+    // (character) index. For ASCII rows the two coincide, but if the
+    // row has multi-byte UTF-8 chars before the URL we'd compare
+    // mismatched units and miss the click. Convert byte offsets to
+    // character offsets by counting chars up to each match boundary.
+    let mut best: Option<&str> = None;
     for m in re.find_iter(row_text) {
-        // `m.start()` and `m.end()` are byte offsets, which equal
-        // character offsets for ASCII URLs. Real-world URLs are
-        // virtually always ASCII; if a non-ASCII char snuck in we'd
-        // still get the right *containment* answer because the col
-        // is also in the same offset space (the row is built from
-        // single-char cells).
-        if col >= m.start() && col < m.end() {
-            best = Some((m.start(), m.end(), m.as_str()));
+        let start_char = row_text[..m.start()].chars().count();
+        let end_char = start_char + m.as_str().chars().count();
+        if col >= start_char && col < end_char {
+            best = Some(m.as_str());
             break;
         }
     }
-    let (_, _, raw) = best?;
+    let raw = best?;
     // Trim trailing punctuation that's almost always prose, not URL.
     let trimmed = raw.trim_end_matches(|c: char| ".,;:!?)]}>\"'".contains(c));
     if trimmed.is_empty() {
@@ -10135,5 +10136,26 @@ mod tests {
             extract_url_at_column(row, 5).as_deref(),
             Some("https://example.com/path?x=1&y=2#section")
         );
+    }
+
+    #[test]
+    fn extract_url_handles_multibyte_chars_before_url() {
+        // Each Japanese char is 3 UTF-8 bytes but renders as 1 cell column.
+        // The clicked column is a char index, so we must convert regex
+        // byte offsets to char offsets before comparison.
+        // "こんにちは " = 5 chars + 1 space = 6 columns; URL starts at column 6.
+        let row = "こんにちは https://example.com";
+        // Click on the 'h' (column 6) — first byte of URL is at byte 16.
+        assert_eq!(
+            extract_url_at_column(row, 6).as_deref(),
+            Some("https://example.com")
+        );
+        // Click in the middle of the URL (column 14, the 'p' in '.com'-ish).
+        assert_eq!(
+            extract_url_at_column(row, 14).as_deref(),
+            Some("https://example.com")
+        );
+        // Click on the leading Japanese — should NOT match.
+        assert!(extract_url_at_column(row, 2).is_none());
     }
 }
