@@ -402,12 +402,21 @@ impl AppState {
         }
     }
 
-    /// Walk every session and transition `Working` → `Pending` when the
-    /// session has been working for at least `timeout` without firing any
-    /// new event and without an active tool. This catches the case where
-    /// an agent stalls at an interactive prompt that has no corresponding
-    /// hook event (e.g., Copilot CLI printing a "1/2/3 — pick one" menu and
-    /// waiting on stdin).
+    /// Walk every session and transition `Working` or `Thinking` → `Pending`
+    /// when the session has stalled for at least `timeout` without firing
+    /// any new event and without an active tool. This catches two cases:
+    ///
+    ///   1. **Post-tool stall**: agent fires `postToolUse`, then prints an
+    ///      interactive menu ("Did you mean 1, 2, or 3?") and waits on
+    ///      stdin without firing any further hook event. Status is
+    ///      `Working` at the time.
+    ///   2. **Thinking stall**: agent fires `userPromptSubmitted` (→
+    ///      `Thinking`) and then prints a clarifying question directly
+    ///      *without* going through a tool. Status stays `Thinking`
+    ///      indefinitely until the user responds.
+    ///
+    /// Both manifest in the dashboard as a frozen-looking spinner with no
+    /// active tool, which is what the heuristic keys on.
     ///
     /// Returns the set of session IDs that just transitioned so callers
     /// can fire a bell or update other side-effects exactly once per
@@ -420,21 +429,28 @@ impl AppState {
     /// flips (and bell rings) on system resume, durations above
     /// `CLOCK_SKEW_REJECTION_THRESHOLD` are treated as "the clock just
     /// jumped, can't trust this" and skipped. The threshold is chosen
-    /// generously enough that no realistic Working-session timeout would
-    /// ever exceed it.
+    /// generously enough that no realistic timeout value would ever
+    /// exceed it.
     ///
     /// **By-design caveat.** The heuristic intentionally cannot distinguish
     /// "agent is stuck at a non-hook prompt" from "agent is taking longer
-    /// than `timeout` to decide its next move between tools". Both look
-    /// like `status=Working AND active_tool=None`. The default 10 s timeout
-    /// is generous enough for typical sub-second LLM gaps; if a user runs
-    /// into the false-positive case they can tune `pending.timeout_seconds`
-    /// up or set it to 0 to disable the heuristic entirely.
+    /// than `timeout` to think/decide". Both look like
+    /// `status=Working|Thinking AND active_tool=None`. The default 10 s
+    /// timeout is generous enough for typical LLM gaps; if a user runs
+    /// into the false-positive case (very long Thinking on complex
+    /// prompts) they can tune `pending.timeout_seconds` up or set it to
+    /// 0 to disable the heuristic entirely.
     pub fn apply_pending_timeout(&mut self, timeout: chrono::Duration) -> Vec<String> {
         let now = Utc::now();
         let mut transitioned = Vec::new();
         for (sid, session) in self.sessions.iter_mut() {
-            if session.status != SessionStatus::Working {
+            // Both Working and Thinking are bell-eligible: Working catches
+            // the post-tool-stall case, Thinking catches the
+            // clarifying-question-without-tool case.
+            if !matches!(
+                session.status,
+                SessionStatus::Working | SessionStatus::Thinking
+            ) {
                 continue;
             }
             if session.active_tool.is_some() {
@@ -1168,8 +1184,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_timeout_ignores_non_working_statuses() {
-        // Thinking, Idle, WaitingForInput, Compacting, Error all stay.
+    fn pending_timeout_ignores_non_eligible_statuses() {
+        // Idle, WaitingForInput, Compacting, Error all stay — only
+        // Working and Thinking are eligible to transition to Pending
+        // (those are the two states that show as "agent is processing
+        // but no tool is actively running" in the UI, which is where a
+        // non-hook stall manifests). Pending itself is also excluded
+        // so a repeated apply doesn't oscillate.
         let mut state = AppState::default();
         state.register_pane("p1".into());
         state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
@@ -1178,11 +1199,11 @@ mod tests {
             Utc::now() - chrono::Duration::seconds(60);
 
         for status in [
-            SessionStatus::Thinking,
             SessionStatus::Idle,
             SessionStatus::WaitingForInput,
             SessionStatus::Compacting,
             SessionStatus::Error,
+            SessionStatus::Pending,
         ] {
             state.sessions.get_mut("s1").unwrap().status = status.clone();
             let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
@@ -1192,6 +1213,28 @@ mod tests {
             );
             assert_eq!(state.sessions["s1"].status, status);
         }
+    }
+
+    #[test]
+    fn pending_timeout_flips_stale_thinking_session_to_pending() {
+        // Regression guard for the Copilot CLI clarifying-question case:
+        // when the agent fires userPromptSubmitted (→ Thinking) and then
+        // prints a clarifying menu directly without going through a
+        // tool, status stays Thinking until the user responds. The
+        // heuristic must catch this stall too, not only the
+        // post-tool variant.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::Thinking, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Thinking);
+        assert!(state.sessions["s1"].active_tool.is_none());
+
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert_eq!(transitioned, vec!["s1".to_string()]);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
     }
 
     #[test]
