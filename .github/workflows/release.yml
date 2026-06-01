@@ -88,11 +88,13 @@ jobs:
             artifact_suffix: windows-amd64
             use_cross: false
             binary_ext: ".exe"
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-            artifact_suffix: windows-arm64
-            use_cross: false
-            binary_ext: ".exe"
+          # NOTE: aarch64-pc-windows-msvc was previously listed here but
+          # building it on a windows-latest x64 runner requires the ARM64
+          # MSVC toolchain components, which are not installed by default
+          # and `cross` does not support MSVC targets. Re-add this entry
+          # once we ship to ARM64 Windows users and can wire up the
+          # toolchain install step (see microsoft/setup-msbuild + the
+          # "Microsoft.VisualStudio.Component.VC.Tools.ARM64" component).
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5

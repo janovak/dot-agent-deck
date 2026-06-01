@@ -133,23 +133,58 @@ pub fn uninstall() -> std::io::Result<()> {
 }
 
 /// Silent auto-install on dashboard startup. Skips if `~/.copilot/hooks/`
-/// doesn't exist (i.e. Copilot CLI not installed) or if the config file is
-/// already in place — preserves any other integrations' files untouched.
+/// doesn't exist (i.e. Copilot CLI not installed). Writes the config when
+/// missing, *and* refreshes it when the existing config points at a
+/// different binary path than this process — without the refresh, a user
+/// who upgrades or moves the dot-agent-deck binary would leave Copilot
+/// invoking the stale (possibly missing) path forever.
 pub fn auto_install() {
     let hooks_dir = copilot_hooks_dir();
     if !hooks_dir.exists() {
         return;
     }
     let path = config_path();
-    if path.exists() {
+    let binary_path = current_binary_path();
+
+    // Skip the write when the existing config already targets this binary.
+    // The check intentionally tolerates parse errors (treat as "needs
+    // refresh") so a corrupted file gets rewritten instead of permanently
+    // ignored.
+    if path.exists() && existing_config_targets(&path, &binary_path) {
         return;
     }
-    let binary_path = current_binary_path();
+
     if let Err(e) = write_config_to(&path, &binary_path) {
         tracing::warn!("auto-install: failed to write Copilot CLI hooks: {e}");
         return;
     }
-    tracing::info!("auto-installed Copilot CLI hooks at {}", path.display());
+    tracing::info!(
+        "auto-installed Copilot CLI hooks at {} (binary: {binary_path})",
+        path.display()
+    );
+}
+
+/// Returns `true` when the on-disk hook config's bash command for any event
+/// already contains `binary_path`. Conservative: a JSON parse failure or
+/// missing event arrays count as "not targeting this binary" so we rewrite.
+fn existing_config_targets(path: &Path, binary_path: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+        return false;
+    };
+    let Some(hooks) = value.get("hooks").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    // Picking any one event's bash command is enough — auto_install writes
+    // them all from the same source so they always agree.
+    hooks
+        .values()
+        .filter_map(|v| v.as_array())
+        .flatten()
+        .filter_map(|entry| entry.get("bash").and_then(|v| v.as_str()))
+        .any(|bash| bash.contains(binary_path))
 }
 
 #[cfg(test)]
@@ -213,5 +248,43 @@ mod tests {
         assert!(s.contains(".copilot"));
         assert!(s.contains("hooks"));
         assert!(s.ends_with("dot-agent-deck.json"));
+    }
+
+    #[test]
+    fn existing_config_targets_returns_true_for_matching_binary() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("dot-agent-deck.json");
+        write_config_to(&path, "/opt/bin/dad").unwrap();
+        assert!(existing_config_targets(&path, "/opt/bin/dad"));
+    }
+
+    #[test]
+    fn existing_config_targets_returns_false_for_stale_binary() {
+        // Regression guard for the auto_install refresh path: when the
+        // on-disk config bakes in a different binary path than the running
+        // process, we *must* report it as stale so it gets rewritten —
+        // otherwise upgrading dot-agent-deck would silently leave Copilot
+        // invoking a now-missing executable.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("dot-agent-deck.json");
+        write_config_to(&path, "/old/path/dad").unwrap();
+        assert!(!existing_config_targets(&path, "/new/path/dad"));
+    }
+
+    #[test]
+    fn existing_config_targets_returns_false_for_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("does-not-exist.json");
+        assert!(!existing_config_targets(&path, "/any/path"));
+    }
+
+    #[test]
+    fn existing_config_targets_returns_false_for_corrupt_json() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("corrupt.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
+        // Corrupt → reports as not targeting → caller rewrites. This is the
+        // self-healing path.
+        assert!(!existing_config_targets(&path, "/any/path"));
     }
 }
