@@ -472,21 +472,30 @@ impl AppState {
             let elapsed = now.signed_duration_since(session.last_activity);
             let elapsed_ms = elapsed.num_milliseconds();
 
-            if session.active_tool.is_some() {
-                // A diagnostic for the user-reported "Pending never fires"
-                // case. The most common explanation in real-world Copilot
-                // CLI usage is that a tool is running back-to-back, so the
-                // Working+no-tool window is too brief for the timeout to
-                // elapse. Logging the active tool name + how long the gate
-                // would have needed makes that observable.
-                info!(
-                    session_id = %sid,
-                    status = ?session.status,
-                    elapsed_ms,
-                    active_tool = %session.active_tool.as_ref().map(|t| t.name.as_str()).unwrap_or("?"),
-                    "pending_check skipped: active_tool"
-                );
-                continue;
+            if let Some(ref tool) = session.active_tool {
+                // Most active tools are legitimate work (Bash, Edit,
+                // long-running searches). Skipping when one is running
+                // prevents false-positive Pending on those.
+                //
+                // EXCEPT: Copilot CLI implements clarifying questions
+                // ("Did you mean 1, 2, or 3?") as a tool called
+                // `ask_user` that blocks until the user picks an
+                // option. From the gate's perspective the session looks
+                // like a long-running tool, but it's actually waiting
+                // on the user — the *exact* case Pending exists to
+                // surface. Treat known interactive-prompt tool names
+                // as Pending-eligible despite being "active", and let
+                // the normal elapsed-timeout check decide.
+                if !is_interactive_prompt_tool(&tool.name) {
+                    info!(
+                        session_id = %sid,
+                        status = ?session.status,
+                        elapsed_ms,
+                        active_tool = %tool.name,
+                        "pending_check skipped: active_tool"
+                    );
+                    continue;
+                }
             }
             // Background subagents are legitimate work — don't false-positive
             // them into Pending. The parent agent simply hasn't fired events
@@ -518,6 +527,7 @@ impl AppState {
                     from_status = ?session.status,
                     elapsed_ms,
                     timeout_ms = timeout.num_milliseconds(),
+                    active_tool = %session.active_tool.as_ref().map(|t| t.name.as_str()).unwrap_or(""),
                     "pending_check fired: transitioning to Pending"
                 );
                 session.status = SessionStatus::Pending;
@@ -528,6 +538,7 @@ impl AppState {
                     status = ?session.status,
                     elapsed_ms,
                     timeout_ms = timeout.num_milliseconds(),
+                    active_tool = %session.active_tool.as_ref().map(|t| t.name.as_str()).unwrap_or(""),
                     "pending_check waiting: eligible but below timeout"
                 );
             }
@@ -544,6 +555,29 @@ impl AppState {
 /// resume. 24 h is large enough that no realistic `pending.timeout_seconds`
 /// value would be missed by this guard.
 const CLOCK_SKEW_REJECTION_THRESHOLD: chrono::Duration = chrono::Duration::hours(24);
+
+/// Known agent tool names whose entire purpose is to block on user
+/// input. When one of these is the active tool, `apply_pending_timeout`
+/// treats the session as Pending-eligible (despite an active tool)
+/// because the user's attention is exactly what the tool is waiting for.
+///
+/// Match is case-insensitive on the tool name only. Currently observed:
+///
+/// * `ask_user` — Copilot CLI's clarifying-question / menu-choice
+///   tool. Observed in production logs as `active_tool=ask_user` for
+///   2+ minutes while the user reads the prompt.
+///
+/// Extend this list when new agents are observed to use a similar
+/// blocking-on-stdin pattern under a different tool name.
+const INTERACTIVE_PROMPT_TOOL_NAMES: &[&str] = &["ask_user"];
+
+/// Helper: returns true when `name` is in `INTERACTIVE_PROMPT_TOOL_NAMES`
+/// (case-insensitive comparison).
+fn is_interactive_prompt_tool(name: &str) -> bool {
+    INTERACTIVE_PROMPT_TOOL_NAMES
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1361,6 +1395,60 @@ mod tests {
         let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert_eq!(transitioned, vec!["s1".to_string()]);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
+    }
+
+    #[test]
+    fn pending_timeout_fires_when_active_tool_is_ask_user() {
+        // Copilot CLI's clarifying-question pattern presents as an active
+        // tool named `ask_user` that blocks until the user picks an
+        // option. The Pending heuristic must treat this case as
+        // eligible — not skip on `active_tool.is_some()` — because
+        // the user's attention is exactly what the tool is waiting for.
+        // Confirmed in production logs: status=Working active_tool=ask_user
+        // for 2+ minutes with no other events.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("ask_user".into());
+        state.apply_event(tool);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert!(state.sessions["s1"].active_tool.is_some());
+
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert_eq!(transitioned, vec!["s1".to_string()]);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
+    }
+
+    #[test]
+    fn is_interactive_prompt_tool_is_case_insensitive() {
+        assert!(is_interactive_prompt_tool("ask_user"));
+        assert!(is_interactive_prompt_tool("ASK_USER"));
+        assert!(is_interactive_prompt_tool("Ask_User"));
+        assert!(!is_interactive_prompt_tool("ask"));
+        assert!(!is_interactive_prompt_tool("Bash"));
+        assert!(!is_interactive_prompt_tool(""));
+    }
+
+    #[test]
+    fn pending_timeout_still_skips_normal_active_tool() {
+        // Regression guard for the interactive-prompt special case:
+        // non-interactive tools (Bash, Edit, etc.) must still skip the
+        // gate, otherwise every long-running tool would false-positive
+        // into Pending.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("Bash".into());
+        state.apply_event(tool);
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(60);
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(transitioned.is_empty());
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
     }
 
     #[test]
