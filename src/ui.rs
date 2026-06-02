@@ -1264,9 +1264,20 @@ fn classify_auto_save_error(err: &str, existing_warnings: &[String]) -> Option<S
 
 /// Auto-save the current workspace if it changed since the last save.
 fn auto_save_workspace(ui: &mut UiState, state: &SharedState) {
-    let live_panes = state.blocking_read().managed_pane_ids.clone();
-    let current =
-        config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
+    // Take a single read lock to collect every input snapshot needs.
+    // Cloning under one acquisition keeps `managed_pane_ids` and
+    // `sessions` consistent (no risk of a session start landing in
+    // the middle of our snapshot and producing a half-updated save).
+    let (live_panes, sessions) = {
+        let snap = state.blocking_read();
+        (snap.managed_pane_ids.clone(), snap.sessions.clone())
+    };
+    let current = config::SavedSession::snapshot(
+        &mut ui.pane_metadata,
+        &ui.pane_display_names,
+        &live_panes,
+        &sessions,
+    );
     if ui.last_saved_session.as_ref() == Some(&current) {
         return;
     }
@@ -2855,10 +2866,15 @@ pub fn run_tui(
                     }
                 }
             }
-            let cmd = if saved_pane.command.is_empty() {
+            let restore_cmd = config::build_resume_command(
+                &saved_pane.command,
+                saved_pane.session_id.as_deref(),
+                saved_pane.agent_type.as_ref(),
+            );
+            let cmd = if restore_cmd.is_empty() {
                 None
             } else {
-                Some(saved_pane.command.as_str())
+                Some(restore_cmd.as_str())
             };
             // First restored dashboard pane will be focused after the loop
             // (see the post-loop `focus_pane(first_id)` block); the rest are
@@ -2951,8 +2967,13 @@ pub fn run_tui(
                             if let Some(ref init_cmd) = mode_config.init_command {
                                 let _ = pane.write_to_pane(&new_id, init_cmd);
                             }
-                            if !saved_pane.command.is_empty() {
-                                let _ = pane.write_to_pane(&new_id, &saved_pane.command);
+                            let mode_cmd = config::build_resume_command(
+                                &saved_pane.command,
+                                saved_pane.session_id.as_deref(),
+                                saved_pane.agent_type.as_ref(),
+                            );
+                            if !mode_cmd.is_empty() {
+                                let _ = pane.write_to_pane(&new_id, &mode_cmd);
                             }
                         }
                         Err(e) => {
@@ -2969,10 +2990,15 @@ pub fn run_tui(
                             // gets a usable pane (PRD #69 acceptance criterion).
                             // Spawn at layout size to avoid the 24×80 startup
                             // race (matches the new-pane + restore paths).
-                            let cmd = if saved_pane.command.is_empty() {
+                            let fb_cmd = config::build_resume_command(
+                                &saved_pane.command,
+                                saved_pane.session_id.as_deref(),
+                                saved_pane.agent_type.as_ref(),
+                            );
+                            let cmd = if fb_cmd.is_empty() {
                                 None
                             } else {
-                                Some(saved_pane.command.as_str())
+                                Some(fb_cmd.as_str())
                             };
                             mode_fallback_count = mode_fallback_count.saturating_add(1);
                             let frame_area = terminal.get_frame().area();
@@ -3021,10 +3047,15 @@ pub fn run_tui(
                         "Warning: failed to restore mode pane '{}': {e}",
                         saved_pane.name
                     ));
-                    let cmd = if saved_pane.command.is_empty() {
+                    let outer_fb_cmd = config::build_resume_command(
+                        &saved_pane.command,
+                        saved_pane.session_id.as_deref(),
+                        saved_pane.agent_type.as_ref(),
+                    );
+                    let cmd = if outer_fb_cmd.is_empty() {
                         None
                     } else {
-                        Some(saved_pane.command.as_str())
+                        Some(outer_fb_cmd.as_str())
                     };
                     // Spawn fallback dashboard pane at layout size.
                     mode_fallback_count = mode_fallback_count.saturating_add(1);
@@ -3088,11 +3119,15 @@ pub fn run_tui(
     // session if we started blank) so the auto-save loop below won't fire
     // a redundant write on the very first iteration.
     {
-        let live_panes = state.blocking_read().managed_pane_ids.clone();
+        let (live_panes, sessions) = {
+            let snap = state.blocking_read();
+            (snap.managed_pane_ids.clone(), snap.sessions.clone())
+        };
         let seeded = config::SavedSession::snapshot(
             &mut ui.pane_metadata,
             &ui.pane_display_names,
             &live_panes,
+            &sessions,
         );
         ui.last_saved_session = Some(seeded);
     }
@@ -4641,6 +4676,8 @@ pub fn run_tui(
                                             name: req.name.clone(),
                                             command: req.command,
                                             mode: mode_name_for_save,
+                                            session_id: None,
+                                            agent_type: None,
                                         },
                                     );
 
@@ -4875,12 +4912,16 @@ pub fn run_tui(
     // `retain` step would drop the mode-tab agent pane (which carries
     // `mode = Some(...)`) and the mode field would never reach disk (PRD #69).
     {
-        let live_panes = state.blocking_read().managed_pane_ids.clone();
+        let (live_panes, sessions) = {
+            let snap = state.blocking_read();
+            (snap.managed_pane_ids.clone(), snap.sessions.clone())
+        };
 
         let session = config::SavedSession::snapshot(
             &mut ui.pane_metadata,
             &ui.pane_display_names,
             &live_panes,
+            &sessions,
         );
         if session.panes.is_empty() {
             if let Err(e) = config::SavedSession::clear(workspace.as_deref()) {

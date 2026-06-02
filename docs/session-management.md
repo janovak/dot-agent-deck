@@ -53,7 +53,7 @@ Without `--continue`, the dashboard starts with a blank slate. If a saved direct
 
 After restore the dashboard is shown first so you get an overview before switching to a specific tab.
 
-Mode tabs are also restored: each agent pane records which mode it belonged to, and `--continue` reopens the full mode tab — tab name, agent pane and its command, and all side panes with their commands — by looking up the mode config from the project's `.dot-agent-deck.toml`. The agent's internal conversation state is not restored; only the workspace structure is. If `.dot-agent-deck.toml` is missing or the mode was renamed at restore time, a warning is printed to stderr and the pane falls back to a plain dashboard pane.
+Mode tabs are also restored: each agent pane records which mode it belonged to, and `--continue` reopens the full mode tab — tab name, agent pane and its command, and all side panes with their commands — by looking up the mode config from the project's `.dot-agent-deck.toml`. When the agent pane was running Copilot CLI or Claude Code with a bare invocation (just `copilot` or `claude` — no extra flags or wrappers), the launch command is rewritten to `<agent> --resume <session_id>` so the actual conversation is restored, not just the pane layout. If the pane's command was customized (extra flags, `npx`, wrapper scripts, etc.) the original command is preserved untouched. If `.dot-agent-deck.toml` is missing or the mode was renamed at restore time, a warning is printed to stderr and the pane falls back to a plain dashboard pane.
 
 Session data is stored in `~/.config/dot-agent-deck/session.toml`.
 
@@ -84,7 +84,7 @@ dot-agent-deck workspaces delete client-x   # delete one
 
 - Workspace names must be 1–64 characters from `[A-Za-z0-9_-]`. No spaces, slashes, dots, or other punctuation. Windows reserved device names (`con`, `prn`, `aux`, `nul`, `com1`…`com9`, `lpt1`…`lpt9`) are rejected.
 - `--continue` and `--workspace` are mutually exclusive — pick one.
-- The agent's internal conversation state still isn't restored (same caveat as `--continue`). Use `claude --continue` or `opencode --resume` as the pane's saved command if you want the agent to resume its prior conversation.
+- Conversation resume works automatically for Copilot CLI and Claude Code panes whose saved command is a bare `copilot` or `claude` (optionally already carrying a stale `--resume <id>`). The save step captures each pane's live `session_id` and `agent_type` and the restore step rewrites the launch command to `<agent> --resume <session_id>`. OpenCode panes aren't rewritten (the UI doesn't have a tested `--resume` shape for it yet), and any pane with a customized command is preserved untouched so you don't lose hand-tuned flags. If multiple agents have run in the same pane since the last save, the most-recently-active conversation is the one that gets resumed.
 
 ### Where files live
 

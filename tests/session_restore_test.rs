@@ -170,6 +170,8 @@ fn snapshot_preserves_mode_field_when_called_pre_teardown() {
             name: "plain".to_string(),
             command: "bash".to_string(),
             mode: None,
+            session_id: None,
+            agent_type: None,
         },
     );
     pane_metadata.insert(
@@ -179,6 +181,8 @@ fn snapshot_preserves_mode_field_when_called_pre_teardown() {
             name: "k8s-agent".to_string(),
             command: "claude".to_string(),
             mode: Some("kubernetes-operations".to_string()),
+            session_id: None,
+            agent_type: None,
         },
     );
 
@@ -187,7 +191,12 @@ fn snapshot_preserves_mode_field_when_called_pre_teardown() {
     let live_panes: HashSet<String> = ["1".to_string(), "2".to_string()].into_iter().collect();
     let pane_display_names: HashMap<String, String> = HashMap::new();
 
-    let session = SavedSession::snapshot(&mut pane_metadata, &pane_display_names, &live_panes);
+    let session = SavedSession::snapshot(
+        &mut pane_metadata,
+        &pane_display_names,
+        &live_panes,
+        &HashMap::new(),
+    );
 
     assert_eq!(session.panes.len(), 2);
     let mode_pane = session
@@ -216,6 +225,8 @@ fn snapshot_prunes_externally_closed_panes() {
             name: "alive".to_string(),
             command: "bash".to_string(),
             mode: None,
+            session_id: None,
+            agent_type: None,
         },
     );
     pane_metadata.insert(
@@ -225,6 +236,8 @@ fn snapshot_prunes_externally_closed_panes() {
             name: "externally-closed".to_string(),
             command: "bash".to_string(),
             mode: None,
+            session_id: None,
+            agent_type: None,
         },
     );
 
@@ -232,7 +245,12 @@ fn snapshot_prunes_externally_closed_panes() {
     let live_panes: HashSet<String> = ["1".to_string()].into_iter().collect();
     let pane_display_names: HashMap<String, String> = HashMap::new();
 
-    let session = SavedSession::snapshot(&mut pane_metadata, &pane_display_names, &live_panes);
+    let session = SavedSession::snapshot(
+        &mut pane_metadata,
+        &pane_display_names,
+        &live_panes,
+        &HashMap::new(),
+    );
 
     assert_eq!(session.panes.len(), 1);
     assert_eq!(session.panes[0].name, "alive");
@@ -256,12 +274,19 @@ fn snapshot_save_load_round_trips_mode_field() {
             name: "k8s-agent".to_string(),
             command: "claude".to_string(),
             mode: Some("kubernetes-operations".to_string()),
+            session_id: None,
+            agent_type: None,
         },
     );
     let live_panes: HashSet<String> = ["7".to_string()].into_iter().collect();
     let pane_display_names: HashMap<String, String> = HashMap::new();
 
-    let session = SavedSession::snapshot(&mut pane_metadata, &pane_display_names, &live_panes);
+    let session = SavedSession::snapshot(
+        &mut pane_metadata,
+        &pane_display_names,
+        &live_panes,
+        &HashMap::new(),
+    );
     session.save(None).expect("save should succeed");
     assert!(path.exists(), "save must create session.toml");
 
@@ -303,11 +328,18 @@ fn save_then_restore_recreates_side_panes() {
             name: "my-mode-tab".to_string(),
             command: "claude".to_string(),
             mode: Some("kubernetes-operations".to_string()),
+            session_id: None,
+            agent_type: None,
         },
     );
     let live_panes: HashSet<String> = ["42".to_string()].into_iter().collect();
     let pane_display_names: HashMap<String, String> = HashMap::new();
-    let session = SavedSession::snapshot(&mut pane_metadata, &pane_display_names, &live_panes);
+    let session = SavedSession::snapshot(
+        &mut pane_metadata,
+        &pane_display_names,
+        &live_panes,
+        &HashMap::new(),
+    );
     session.save(None).unwrap();
 
     // ---- Restore side ----

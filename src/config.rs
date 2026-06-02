@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::SessionStatus;
+use crate::event::AgentType;
+use crate::state::{SessionState, SessionStatus, is_placeholder_session_id};
 use crate::theme::Theme;
 
 pub const CONFIG_KEYS: &[(&str, &str)] = &[
@@ -433,6 +434,23 @@ pub struct SavedPane {
     /// The value is the mode name from the project config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Live agent session id at the moment this snapshot was taken.
+    /// Used together with `agent_type` to reconstruct a
+    /// `<agent> --resume <id>` command at restore time so workspaces
+    /// reopen the same conversation instead of a fresh one.
+    ///
+    /// `None` means either (a) the pane never bound to a real agent
+    /// session (still on placeholder), or (b) the saved `command`
+    /// isn't a simple agent invocation we can safely rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Agent type that produced `session_id`. Needed because the
+    /// `--resume` syntax is per-agent (e.g., `copilot --resume <id>`
+    /// vs.\ `claude --resume <id>`; OpenCode has no equivalent flag).
+    /// Kept in lock-step with `session_id` — either both populated
+    /// or both `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<AgentType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -537,16 +555,59 @@ impl SavedSession {
     /// `retain` here only prunes panes the user externally closed before exit;
     /// running it after teardown would also drop the mode-tab agent pane and lose
     /// the mode field, breaking `--continue` restoration (PRD #69).
+    ///
+    /// `sessions` is consulted to populate per-pane `session_id` and
+    /// `agent_type` so a restored workspace can spawn `<agent> --resume <id>`
+    /// instead of a fresh conversation. For each pane we pick the
+    /// most-recently-active *real* session — placeholders (which carry
+    /// `agent_type == None` and `session_id` shaped as `pane-<n>`, see
+    /// `is_placeholder_session_id`) are skipped.
+    ///
+    /// When no real session matches we *preserve* any previously-stored
+    /// resume metadata rather than clearing it. The seeded snapshot
+    /// runs immediately after restore, before the freshly-spawned
+    /// agent has emitted `SessionStart`; clearing there would wipe the
+    /// id the user just restored from disk if they exit the workspace
+    /// before the agent boots. This matches the
+    /// "bookmark id may go stale" tradeoff the existing bookmark
+    /// feature already accepts.
     pub fn snapshot(
         pane_metadata: &mut HashMap<String, SavedPane>,
         pane_display_names: &HashMap<String, String>,
         live_panes: &HashSet<String>,
+        sessions: &HashMap<String, SessionState>,
     ) -> Self {
         pane_metadata.retain(|id, _| live_panes.contains(id));
         for (id, meta) in pane_metadata.iter_mut() {
             if let Some(name) = pane_display_names.get(id) {
                 meta.name = name.clone();
             }
+            // Find the most-recently-active real session bound to this
+            // pane. Picking the latest handles real-→-real restarts on
+            // the same pane (`/clear`, Claude `/restart`) where
+            // `apply_event` updates the SessionState's `session_id`
+            // field to the live id while keeping the old map key. We
+            // read the field, not the key.
+            //
+            // The `is_placeholder_session_id` guard is belt-and-
+            // suspenders alongside `agent_type != None` — placeholders
+            // always have both set, but checking the id shape too
+            // catches the (theoretical) case where someone forgets to
+            // set agent_type when constructing a placeholder.
+            let matching = sessions
+                .values()
+                .filter(|s| {
+                    s.pane_id.as_deref() == Some(id.as_str())
+                        && s.agent_type != AgentType::None
+                        && !is_placeholder_session_id(&s.session_id)
+                })
+                .max_by_key(|s| s.last_activity);
+            if let Some(s) = matching {
+                meta.session_id = Some(s.session_id.clone());
+                meta.agent_type = Some(s.agent_type.clone());
+            }
+            // else: leave existing meta.session_id / meta.agent_type
+            // alone. See doc comment above.
         }
         let mut ids: Vec<&String> = pane_metadata.keys().collect();
         ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
@@ -557,6 +618,107 @@ impl SavedSession {
                 .collect(),
         }
     }
+}
+
+/// Drop any `--resume <id>` token pair from a shell command line.
+///
+/// Operates on whitespace-separated tokens — adequate for the limited
+/// `<agent>` / `<agent> --resume <id>` shapes `is_simple_agent_invocation`
+/// gates on. Not safe for arbitrary quoted shell args; callers must
+/// confirm the command is simple before relying on the round-trip.
+fn strip_resume_flag(command: &str) -> String {
+    let mut tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "--resume" {
+            tokens.remove(i);
+            if i < tokens.len() {
+                tokens.remove(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    tokens.join(" ")
+}
+
+/// Returns `true` if `command` is a bare invocation of the binary for
+/// `agent`, with no arguments other than an optional `--resume <id>`
+/// pair. Path-aware: a fully-qualified `C:\…\copilot.exe` is accepted.
+///
+/// This is the gate workspace-restore uses before rewriting a command
+/// to inject `--resume <session_id>`. Anything more complex (custom
+/// flags, wrappers like `npx copilot` or `cmd /c copilot`, quoted args,
+/// pipelines) is left untouched so we don't silently corrupt a power
+/// user's command line.
+fn is_simple_agent_invocation(command: &str, agent: &AgentType) -> bool {
+    let stripped = strip_resume_flag(command);
+    let trimmed = stripped.trim();
+    let mut tokens = trimmed.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if tokens.next().is_some() {
+        // More than one token after --resume stripping → custom args
+        // we can't safely round-trip.
+        return false;
+    }
+    let basename = std::path::Path::new(first)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first);
+    let expected: &[&str] = match agent {
+        AgentType::CopilotCli => &["copilot"],
+        AgentType::ClaudeCode => &["claude"],
+        AgentType::OpenCode | AgentType::None => return false,
+    };
+    expected.iter().any(|n| basename.eq_ignore_ascii_case(n))
+}
+
+/// Returns the launch command rewritten to resume the given session,
+/// when safe to do so. Falls back to `base` unchanged when:
+///   - `session_id` / `agent` are missing (no resume info recorded);
+///   - the agent doesn't support `--resume` (OpenCode, None);
+///   - `base` isn't a simple agent invocation (see
+///     `is_simple_agent_invocation` — quoted args, wrappers, etc.);
+///   - `session_id` contains characters outside `[A-Za-z0-9_-]`.
+///     Real Copilot/Claude ids are UUID-shaped, so anything else
+///     is treated as corrupt and skipped rather than fed into the
+///     PTY where it would be interpreted by the user's shell.
+///
+/// Idempotent across workspace round-trips: a stale `--resume <old>`
+/// in `base` is stripped before the new flag is appended.
+pub fn build_resume_command(
+    base: &str,
+    session_id: Option<&str>,
+    agent: Option<&AgentType>,
+) -> String {
+    let (Some(sid), Some(at)) = (session_id, agent) else {
+        return base.to_string();
+    };
+    if !is_simple_agent_invocation(base, at) {
+        return base.to_string();
+    }
+    if !is_safe_session_id(sid) {
+        return base.to_string();
+    }
+    let stripped = strip_resume_flag(base);
+    let trimmed = stripped.trim();
+    format!("{trimmed} --resume {sid}")
+}
+
+/// Whether a session id is safe to splice into a shell command line.
+///
+/// Real-world Copilot CLI / Claude Code session ids are UUIDs — we
+/// require ASCII alphanumerics, `-`, and `_` only. Anything else
+/// (spaces, shell metacharacters, quotes, newlines) means the value
+/// is corrupted or a malicious agent stdout has injected something
+/// unsafe; the restore code skips the resume rewrite in that case.
+fn is_safe_session_id(sid: &str) -> bool {
+    !sid.is_empty()
+        && sid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 const STAR_PROMPT_INTERVAL: u64 = 10;
@@ -843,12 +1005,16 @@ on_idle = true
                     name: "api".to_string(),
                     command: "claude".to_string(),
                     mode: None,
+                    session_id: None,
+                    agent_type: None,
                 },
                 SavedPane {
                     dir: "/repo/ui".to_string(),
                     name: "ui".to_string(),
                     command: "".to_string(),
                     mode: None,
+                    session_id: None,
+                    agent_type: None,
                 },
             ],
         };
@@ -894,6 +1060,8 @@ on_idle = true
                 name: "test".to_string(),
                 command: "echo hi".to_string(),
                 mode: None,
+                session_id: None,
+                agent_type: None,
             }],
         };
         session.save(None).unwrap();
@@ -1084,6 +1252,8 @@ on_idle = true
                 name: "proj".to_string(),
                 command: "claude".to_string(),
                 mode: None,
+                session_id: None,
+                agent_type: None,
             }],
         };
         session.save(Some("alpha")).unwrap();
@@ -1098,6 +1268,8 @@ on_idle = true
                 name: "other".to_string(),
                 command: "opencode".to_string(),
                 mode: None,
+                session_id: None,
+                agent_type: None,
             }],
         };
         other.save(Some("beta")).unwrap();
@@ -1210,6 +1382,8 @@ on_idle = true
                 name: "proj".to_string(),
                 command: "claude".to_string(),
                 mode: None,
+                session_id: None,
+                agent_type: None,
             }],
         };
         session.save(Some("atomic")).unwrap();
@@ -1236,12 +1410,16 @@ on_idle = true
                     name: "a".to_string(),
                     command: "claude".to_string(),
                     mode: None,
+                    session_id: None,
+                    agent_type: None,
                 },
                 SavedPane {
                     dir: "/b".to_string(),
                     name: "b".to_string(),
                     command: "opencode".to_string(),
                     mode: None,
+                    session_id: None,
+                    agent_type: None,
                 },
             ],
         };
@@ -1580,5 +1758,449 @@ timeout_secs = 600
                 None => std::env::remove_var("DOT_AGENT_DECK_CONFIG_GEN_STATE"),
             }
         }
+    }
+
+    // ----- Workspace-resume helpers -----
+
+    fn make_session(
+        session_id: &str,
+        pane_id: &str,
+        agent: AgentType,
+        seconds_ago: i64,
+    ) -> SessionState {
+        SessionState {
+            session_id: session_id.to_string(),
+            agent_type: agent,
+            cwd: None,
+            status: SessionStatus::Idle,
+            active_tool: None,
+            started_at: chrono::Utc::now(),
+            last_activity: chrono::Utc::now() - chrono::Duration::seconds(seconds_ago),
+            recent_events: Default::default(),
+            tool_count: 0,
+            last_user_prompt: None,
+            first_prompts: vec![],
+            pane_id: Some(pane_id.to_string()),
+            active_subagent_count: 0,
+        }
+    }
+
+    #[test]
+    fn strip_resume_flag_no_op_when_absent() {
+        assert_eq!(strip_resume_flag(""), "");
+        assert_eq!(strip_resume_flag("copilot"), "copilot");
+        assert_eq!(
+            strip_resume_flag("copilot --model foo"),
+            "copilot --model foo"
+        );
+    }
+
+    #[test]
+    fn strip_resume_flag_drops_flag_and_value() {
+        assert_eq!(strip_resume_flag("copilot --resume abc"), "copilot");
+        assert_eq!(
+            strip_resume_flag("copilot --resume abc-123 --model x"),
+            "copilot --model x"
+        );
+    }
+
+    #[test]
+    fn strip_resume_flag_tolerates_dangling_flag() {
+        // No following token — drop just the flag itself.
+        assert_eq!(strip_resume_flag("copilot --resume"), "copilot");
+    }
+
+    #[test]
+    fn strip_resume_flag_removes_multiple_pairs() {
+        assert_eq!(
+            strip_resume_flag("copilot --resume a --resume b"),
+            "copilot"
+        );
+    }
+
+    #[test]
+    fn is_simple_invocation_bare_agent() {
+        assert!(is_simple_agent_invocation(
+            "copilot",
+            &AgentType::CopilotCli
+        ));
+        assert!(is_simple_agent_invocation("claude", &AgentType::ClaudeCode));
+    }
+
+    #[test]
+    fn is_simple_invocation_with_resume_only() {
+        // Existing --resume <id> is the round-trip case — must still qualify.
+        assert!(is_simple_agent_invocation(
+            "copilot --resume abc-123",
+            &AgentType::CopilotCli
+        ));
+    }
+
+    #[test]
+    fn is_simple_invocation_rejects_custom_flags() {
+        assert!(!is_simple_agent_invocation(
+            "copilot --model gpt-5",
+            &AgentType::CopilotCli
+        ));
+        assert!(!is_simple_agent_invocation(
+            "claude --print",
+            &AgentType::ClaudeCode
+        ));
+    }
+
+    #[test]
+    fn is_simple_invocation_rejects_wrappers() {
+        assert!(!is_simple_agent_invocation(
+            "npx copilot",
+            &AgentType::CopilotCli
+        ));
+        assert!(!is_simple_agent_invocation(
+            "cmd /c copilot",
+            &AgentType::CopilotCli
+        ));
+    }
+
+    #[test]
+    fn is_simple_invocation_strips_path_and_exe() {
+        assert!(is_simple_agent_invocation(
+            r"C:\Users\me\bin\copilot.exe",
+            &AgentType::CopilotCli
+        ));
+        assert!(is_simple_agent_invocation(
+            "/usr/local/bin/claude",
+            &AgentType::ClaudeCode
+        ));
+    }
+
+    #[test]
+    fn is_simple_invocation_rejects_agent_mismatch() {
+        // The launch command is `copilot` but the recorded agent type
+        // says `ClaudeCode` — user must have hand-edited TOML, so we
+        // refuse to rewrite (safer to leave the command alone).
+        assert!(!is_simple_agent_invocation(
+            "copilot",
+            &AgentType::ClaudeCode
+        ));
+    }
+
+    #[test]
+    fn is_simple_invocation_rejects_opencode_and_none() {
+        // Neither agent supports `--resume` in this UI, so it can never
+        // be a "simple" rewritable invocation regardless of command text.
+        assert!(!is_simple_agent_invocation(
+            "opencode",
+            &AgentType::OpenCode
+        ));
+        assert!(!is_simple_agent_invocation("copilot", &AgentType::None));
+    }
+
+    #[test]
+    fn build_resume_command_happy_path_copilot() {
+        let out = build_resume_command("copilot", Some("abc-123"), Some(&AgentType::CopilotCli));
+        assert_eq!(out, "copilot --resume abc-123");
+    }
+
+    #[test]
+    fn build_resume_command_happy_path_claude() {
+        let out = build_resume_command("claude", Some("def-456"), Some(&AgentType::ClaudeCode));
+        assert_eq!(out, "claude --resume def-456");
+    }
+
+    #[test]
+    fn build_resume_command_round_trip_is_idempotent() {
+        // Restore writes `copilot --resume X`; on the next save+restore
+        // we must end up with the new id rather than two flags.
+        let first =
+            build_resume_command("copilot", Some("session-1"), Some(&AgentType::CopilotCli));
+        assert_eq!(first, "copilot --resume session-1");
+        let second = build_resume_command(&first, Some("session-2"), Some(&AgentType::CopilotCli));
+        assert_eq!(second, "copilot --resume session-2");
+    }
+
+    #[test]
+    fn build_resume_command_passes_through_complex() {
+        // Custom flags → don't touch.
+        let cmd = "copilot --model gpt-5";
+        assert_eq!(
+            build_resume_command(cmd, Some("x"), Some(&AgentType::CopilotCli)),
+            cmd
+        );
+    }
+
+    #[test]
+    fn build_resume_command_passes_through_opencode() {
+        // No --resume support → leave command alone even if a session id
+        // was somehow recorded.
+        let cmd = "opencode";
+        assert_eq!(
+            build_resume_command(cmd, Some("x"), Some(&AgentType::OpenCode)),
+            cmd
+        );
+    }
+
+    #[test]
+    fn build_resume_command_passes_through_when_missing_metadata() {
+        let cmd = "copilot";
+        assert_eq!(build_resume_command(cmd, None, None), cmd);
+        assert_eq!(build_resume_command(cmd, Some("x"), None), cmd);
+        assert_eq!(
+            build_resume_command(cmd, None, Some(&AgentType::CopilotCli)),
+            cmd
+        );
+    }
+
+    #[test]
+    fn build_resume_command_rejects_unsafe_session_ids() {
+        // Corrupted / hostile ids must not be spliced into a shell
+        // command line. We refuse the rewrite and the original
+        // command is preserved (which means the user gets a fresh
+        // session — annoying but safe).
+        let cmd = "copilot";
+        let bad = [
+            "",
+            "abc 123",           // space
+            "abc;rm -rf /",      // semicolon
+            "abc\nrm",           // newline
+            "abc$(whoami)",      // command substitution
+            "abc`whoami`",       // backticks
+            "abc&whoami",        // background
+            "abc|cat",           // pipe
+            "abc/../etc/passwd", // slash
+            r"abc\foo",          // backslash
+            "\"abc\"",           // quotes
+        ];
+        for sid in bad {
+            assert_eq!(
+                build_resume_command(cmd, Some(sid), Some(&AgentType::CopilotCli)),
+                cmd,
+                "must refuse unsafe session id: {sid:?}"
+            );
+        }
+        // And the happy UUID-shaped case still works.
+        assert_eq!(
+            build_resume_command(cmd, Some("abc-123_DEF-456"), Some(&AgentType::CopilotCli)),
+            "copilot --resume abc-123_DEF-456"
+        );
+    }
+
+    #[test]
+    fn saved_pane_round_trip_with_resume_fields() {
+        let session = SavedSession {
+            panes: vec![SavedPane {
+                dir: "/repo".to_string(),
+                name: "api".to_string(),
+                command: "copilot".to_string(),
+                mode: None,
+                session_id: Some("abc-123".to_string()),
+                agent_type: Some(AgentType::CopilotCli),
+            }],
+        };
+        let s = toml::to_string_pretty(&session).unwrap();
+        // Spelling matters: AgentType serializes snake_case, so the
+        // workspace file we write must look like `copilot_cli`, not
+        // `CopilotCli` or `copilot-cli`. Manual edits in a saved
+        // workspace TOML depend on this being stable.
+        assert!(s.contains("agent_type = \"copilot_cli\""), "got: {s}");
+        assert!(s.contains("session_id = \"abc-123\""), "got: {s}");
+        let loaded: SavedSession = toml::from_str(&s).unwrap();
+        assert_eq!(loaded.panes[0].session_id.as_deref(), Some("abc-123"));
+        assert_eq!(
+            loaded.panes[0].agent_type.as_ref(),
+            Some(&AgentType::CopilotCli)
+        );
+    }
+
+    #[test]
+    fn saved_pane_loads_old_format_without_resume_fields() {
+        // Workspaces saved before this feature shipped don't have the
+        // two new fields. Backward-compat is non-negotiable; otherwise
+        // every user's existing workspaces would fail to load.
+        let old = r#"
+[[panes]]
+dir = "/repo"
+name = "api"
+command = "copilot"
+"#;
+        let loaded: SavedSession = toml::from_str(old).unwrap();
+        assert_eq!(loaded.panes.len(), 1);
+        assert!(loaded.panes[0].session_id.is_none());
+        assert!(loaded.panes[0].agent_type.is_none());
+    }
+
+    #[test]
+    fn snapshot_populates_resume_metadata_from_live_session() {
+        let mut pane_metadata: HashMap<String, SavedPane> = HashMap::new();
+        pane_metadata.insert(
+            "1".to_string(),
+            SavedPane {
+                dir: "/repo".to_string(),
+                name: "api".to_string(),
+                command: "copilot".to_string(),
+                mode: None,
+                session_id: None,
+                agent_type: None,
+            },
+        );
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        sessions.insert(
+            "real-session".to_string(),
+            make_session("real-session", "1", AgentType::CopilotCli, 5),
+        );
+        let live: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let display: HashMap<String, String> = HashMap::new();
+
+        let session = SavedSession::snapshot(&mut pane_metadata, &display, &live, &sessions);
+
+        assert_eq!(session.panes.len(), 1);
+        assert_eq!(session.panes[0].session_id.as_deref(), Some("real-session"));
+        assert_eq!(
+            session.panes[0].agent_type.as_ref(),
+            Some(&AgentType::CopilotCli)
+        );
+    }
+
+    #[test]
+    fn snapshot_picks_most_recently_active_session_for_pane() {
+        // Real-world failure mode: user runs Copilot in a pane, exits
+        // (without sessionEnd), then starts Claude in the same pane.
+        // Both SessionStates linger in `sessions`, both with the same
+        // pane_id. The save MUST record the newer one or restore brings
+        // back the wrong agent.
+        let mut pane_metadata: HashMap<String, SavedPane> = HashMap::new();
+        pane_metadata.insert(
+            "1".to_string(),
+            SavedPane {
+                dir: "/repo".to_string(),
+                name: "p".to_string(),
+                command: "claude".to_string(),
+                mode: None,
+                session_id: None,
+                agent_type: None,
+            },
+        );
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        sessions.insert(
+            "old-copilot".to_string(),
+            make_session("old-copilot", "1", AgentType::CopilotCli, 300),
+        );
+        sessions.insert(
+            "new-claude".to_string(),
+            make_session("new-claude", "1", AgentType::ClaudeCode, 10),
+        );
+        let live: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let display: HashMap<String, String> = HashMap::new();
+
+        let session = SavedSession::snapshot(&mut pane_metadata, &display, &live, &sessions);
+
+        assert_eq!(session.panes[0].session_id.as_deref(), Some("new-claude"));
+        assert_eq!(
+            session.panes[0].agent_type.as_ref(),
+            Some(&AgentType::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_existing_metadata_when_no_live_session() {
+        // The seed snapshot runs immediately after restore, before the
+        // freshly-spawned agent has emitted SessionStart. If we cleared
+        // here, an early exit would wipe the resume id the user just
+        // restored from disk. So we preserve unless a live session
+        // explicitly overrides — accepting the same "id may go stale"
+        // tradeoff bookmarks already have.
+        let mut pane_metadata: HashMap<String, SavedPane> = HashMap::new();
+        pane_metadata.insert(
+            "1".to_string(),
+            SavedPane {
+                dir: "/repo".to_string(),
+                name: "p".to_string(),
+                command: "copilot".to_string(),
+                mode: None,
+                session_id: Some("preserved".to_string()),
+                agent_type: Some(AgentType::CopilotCli),
+            },
+        );
+        let sessions: HashMap<String, SessionState> = HashMap::new();
+        let live: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let display: HashMap<String, String> = HashMap::new();
+
+        let session = SavedSession::snapshot(&mut pane_metadata, &display, &live, &sessions);
+
+        assert_eq!(
+            session.panes[0].session_id.as_deref(),
+            Some("preserved"),
+            "session_id must survive when no live session is bound"
+        );
+        assert_eq!(
+            session.panes[0].agent_type.as_ref(),
+            Some(&AgentType::CopilotCli)
+        );
+    }
+
+    #[test]
+    fn snapshot_ignores_placeholder_sessions() {
+        // Placeholders carry agent_type=None AND a session_id shaped
+        // like "pane-<id>" (see `placeholder_session_id`). The snapshot
+        // must skip them so workspaces don't try to resume `--resume
+        // pane-1`, which no agent CLI recognises.
+        let mut pane_metadata: HashMap<String, SavedPane> = HashMap::new();
+        pane_metadata.insert(
+            "1".to_string(),
+            SavedPane {
+                dir: "/repo".to_string(),
+                name: "p".to_string(),
+                command: "copilot".to_string(),
+                mode: None,
+                session_id: None,
+                agent_type: None,
+            },
+        );
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        sessions.insert(
+            "pane-1".to_string(),
+            make_session("pane-1", "1", AgentType::None, 1),
+        );
+        let live: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let display: HashMap<String, String> = HashMap::new();
+
+        let session = SavedSession::snapshot(&mut pane_metadata, &display, &live, &sessions);
+
+        assert!(session.panes[0].session_id.is_none());
+        assert!(session.panes[0].agent_type.is_none());
+    }
+
+    #[test]
+    fn snapshot_captures_live_id_after_real_to_real_restart() {
+        // After `apply_event` collapses a real→real session restart,
+        // `sessions[OLD_KEY].session_id == NEW_LIVE_ID`. The snapshot
+        // must read the field, not the map key, so the restored
+        // command resumes the live conversation rather than the
+        // original (now-stale) one.
+        let mut pane_metadata: HashMap<String, SavedPane> = HashMap::new();
+        pane_metadata.insert(
+            "1".to_string(),
+            SavedPane {
+                dir: "/repo".to_string(),
+                name: "p".to_string(),
+                command: "copilot".to_string(),
+                mode: None,
+                session_id: None,
+                agent_type: None,
+            },
+        );
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        let mut s = make_session("OLD_KEY", "1", AgentType::CopilotCli, 5);
+        // Diverged field — simulates the apply_event post-restart state.
+        s.session_id = "NEW_LIVE_ID".to_string();
+        sessions.insert("OLD_KEY".to_string(), s);
+        let live: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let display: HashMap<String, String> = HashMap::new();
+
+        let session = SavedSession::snapshot(&mut pane_metadata, &display, &live, &sessions);
+
+        assert_eq!(
+            session.panes[0].session_id.as_deref(),
+            Some("NEW_LIVE_ID"),
+            "snapshot must read SessionState.session_id field, not the map key"
+        );
     }
 }

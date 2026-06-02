@@ -262,6 +262,19 @@ impl AppState {
                     self.sessions.insert(event.session_id.clone(), moved);
                 }
             } else {
+                // Real → real restart (e.g., Claude Code `/restart`, or
+                // user `/clear`-ing then continuing in the same pane).
+                // Keep the existing map key so the card stays in place
+                // and the user-set display name is preserved — but
+                // update the SessionState's own `session_id` field so
+                // workspace resume targets the *current* conversation,
+                // not the stale one. (Map key and field intentionally
+                // diverge from here on; callers that need the live id
+                // — like `SavedSession::snapshot` — must read the
+                // field, not the key.)
+                if let Some(s) = self.sessions.get_mut(&existing_id) {
+                    s.session_id = event.session_id.clone();
+                }
                 let old_id = std::mem::replace(&mut event.session_id, existing_id);
                 if old_id != event.session_id {
                     self.sessions.remove(&old_id);
@@ -623,7 +636,10 @@ fn placeholder_session_id(pane_id: &str) -> String {
 /// the placeholder string (`"pane-3"`, etc.) would persist as the
 /// canonical session_id forever and downstream features like Session
 /// Bookmarks would store unusable IDs.
-fn is_placeholder_session_id(id: &str) -> bool {
+///
+/// Also used by `SavedSession::snapshot` to skip placeholder sessions
+/// when recording per-pane resume metadata.
+pub fn is_placeholder_session_id(id: &str) -> bool {
     id.starts_with(PLACEHOLDER_SESSION_ID_PREFIX)
 }
 
@@ -1325,6 +1341,13 @@ mod tests {
         // pre-fix behavior. We don't churn the key on every restart.
         assert!(state.sessions.contains_key("real-uuid-A"));
         assert!(!state.sessions.contains_key("real-uuid-B"));
+        // But the SessionState's session_id field reflects the live
+        // id so workspace resume targets the current conversation.
+        // Map key and field intentionally diverge after a restart.
+        assert_eq!(
+            state.sessions["real-uuid-A"].session_id, "real-uuid-B",
+            "session_id field must update to the live id after restart"
+        );
     }
 
     #[test]
