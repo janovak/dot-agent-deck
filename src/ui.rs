@@ -2535,19 +2535,29 @@ fn open_bookmark_note_modal(
         return;
     }
 
-    // Look up the human-readable name. Try Copilot's DB first when relevant;
-    // otherwise fall back to the first prompt we've seen in the conversation.
-    let session_name = if session.agent_type == AgentType::CopilotCli {
+    // Look up the human-readable name. Priority:
+    //   1. User-renamed card name (`r` in Dashboard) — explicit user intent
+    //      always wins, matches what's shown on the card itself.
+    //   2. Copilot's auto-generated summary (Copilot CLI sessions only).
+    //   3. First prompt sent in the conversation.
+    //   4. `(unnamed)` as a final fallback.
+    let renamed = ui
+        .display_names
+        .get(sid)
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    let session_name = if let Some(name) = renamed {
+        name
+    } else if session.agent_type == AgentType::CopilotCli {
         crate::bookmark::lookup_copilot_session_name(&session_id)
             .or_else(|| session.first_prompts.first().cloned())
             .unwrap_or_else(|| "(unnamed)".to_string())
     } else {
-        session.first_prompts.first().cloned().unwrap_or_else(|| {
-            ui.display_names
-                .get(sid)
-                .cloned()
-                .unwrap_or_else(|| "(unnamed)".to_string())
-        })
+        session
+            .first_prompts
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "(unnamed)".to_string())
     };
 
     // Prefill with the existing note if this session is already bookmarked.
@@ -8251,6 +8261,94 @@ mod tests {
 
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(!ui.display_names.contains_key("s1"));
+    }
+
+    /// When the user has renamed a card (`r`), opening the bookmark-note
+    /// modal must use that rename as the bookmark's `session_name` — not
+    /// the previous user prompt or Copilot's auto-summary. The card name
+    /// is the user's explicit naming intent; the bookmark should match
+    /// what's shown on the card.
+    #[test]
+    fn open_bookmark_note_modal_uses_renamed_card_name() {
+        let mut ui = default_ui();
+        // Simulate a user rename: card now shows "my-feature-branch".
+        ui.display_names
+            .insert("s1".to_string(), "my-feature-branch".to_string());
+
+        // SessionState has a first prompt that *would* have been used
+        // before this change. ClaudeCode skips the Copilot DB lookup
+        // (which would need filesystem mocking).
+        let mut session = make_session(SessionStatus::Idle);
+        session.session_id = "abcd-1234-real-session-id".to_string();
+        session.first_prompts = vec!["hey can you look at this bug".to_string()];
+
+        let snapshot = AppState::default();
+        let sid = "s1".to_string();
+        let filtered: Vec<(&String, &SessionState)> = vec![(&sid, &session)];
+        ui.selected_index = 0;
+
+        open_bookmark_note_modal(&mut ui, &snapshot, &filtered);
+
+        let target = ui
+            .bookmark_note_target
+            .as_ref()
+            .expect("modal should have opened");
+        assert_eq!(
+            target.session_name, "my-feature-branch",
+            "renamed card name must win over the first prompt"
+        );
+        assert_eq!(target.session_id, "abcd-1234-real-session-id");
+        assert_eq!(ui.mode, UiMode::BookmarkNote);
+    }
+
+    /// Without a user rename, the bookmark name still falls back to the
+    /// first prompt for non-Copilot agents (previous behaviour). Guards
+    /// against accidentally regressing the fallback chain while fixing
+    /// the rename priority.
+    #[test]
+    fn open_bookmark_note_modal_falls_back_to_first_prompt_without_rename() {
+        let mut ui = default_ui();
+        // No display_names entry for s1 → no user rename.
+
+        let mut session = make_session(SessionStatus::Idle);
+        session.session_id = "abcd-1234".to_string();
+        session.first_prompts = vec!["initial prompt text".to_string()];
+
+        let snapshot = AppState::default();
+        let sid = "s1".to_string();
+        let filtered: Vec<(&String, &SessionState)> = vec![(&sid, &session)];
+        ui.selected_index = 0;
+
+        open_bookmark_note_modal(&mut ui, &snapshot, &filtered);
+
+        let target = ui.bookmark_note_target.as_ref().expect("modal opened");
+        assert_eq!(target.session_name, "initial prompt text");
+    }
+
+    /// A whitespace-only or empty rename must not "win" over the
+    /// fallback sources — it's not a real name, and silently picking
+    /// `""` as the bookmark name would be a UX regression.
+    #[test]
+    fn open_bookmark_note_modal_ignores_blank_rename() {
+        let mut ui = default_ui();
+        ui.display_names.insert("s1".to_string(), "   ".to_string());
+
+        let mut session = make_session(SessionStatus::Idle);
+        session.session_id = "abcd-1234".to_string();
+        session.first_prompts = vec!["fallback prompt".to_string()];
+
+        let snapshot = AppState::default();
+        let sid = "s1".to_string();
+        let filtered: Vec<(&String, &SessionState)> = vec![(&sid, &session)];
+        ui.selected_index = 0;
+
+        open_bookmark_note_modal(&mut ui, &snapshot, &filtered);
+
+        let target = ui.bookmark_note_target.as_ref().expect("modal opened");
+        assert_eq!(
+            target.session_name, "fallback prompt",
+            "blank rename must fall through to the first prompt"
+        );
     }
 
     #[test]
