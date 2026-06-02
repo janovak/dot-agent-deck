@@ -127,8 +127,20 @@ enum UiMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneLayout {
+    /// Focused pane gets remaining vertical space; unfocused panes collapse
+    /// to a 1-row titled border. User-toggleable via Ctrl+T (toggles to/from
+    /// `Tiled`).
     Stacked,
+    /// 2-D aspect-aware grid sized to the available area — see
+    /// `compute_tiled_layout`. User-toggleable via Ctrl+T (toggles to/from
+    /// `Stacked`). In Dashboard mode this also hides the session-card sidebar.
     Tiled,
+    /// Every pane visible simultaneously in a single vertical strip
+    /// (`1/N` height each). Internal-only — used by mode-tab side panes
+    /// where every side pane needs to stay visible together regardless
+    /// of focus. Never produced by the Ctrl+T toggle; never stored on
+    /// `UiState`.
+    VerticalStrip,
 }
 
 /// Describes which panes to render and how to lay them out, based on the active tab.
@@ -508,6 +520,11 @@ struct UiState {
     /// Screen rects of session cards on the dashboard (flat_index, rect).
     /// Set during render, used for click-to-focus a card.
     card_rects: Vec<(usize, Rect)>,
+    /// Screen rects of dashboard panes in the right-side terminal area
+    /// (pane_id, rect). Set during render, used for click-to-focus a tiled
+    /// pane that isn't the currently-focused one. Empty in Stacked mode
+    /// (only one pane is visible there, and `focused_pane_rect` covers it).
+    dashboard_pane_rects: Vec<(String, Rect)>,
     /// Screen rects of tab-bar labels (indexed by tab index).
     /// Set during render, used for click-to-switch tabs.
     tab_label_rects: Vec<Rect>,
@@ -602,6 +619,7 @@ impl UiState {
             side_pane_rects: Vec::new(),
             agent_pane_rect: None,
             card_rects: Vec::new(),
+            dashboard_pane_rects: Vec::new(),
             tab_label_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
@@ -664,13 +682,96 @@ fn resize_mode_tab_panes(pane: &dyn PaneController, tab_manager: &TabManager, ar
     }
 }
 
+/// Tile `area` into `pane_count` rectangles using a 2-D grid.
+///
+/// Returns one `Rect` per pane in row-major order. Cell rects are
+/// produced by ratatui's own `Layout::vertical` / `Layout::horizontal`
+/// solvers so resize math and the renderer agree pixel-for-pixel —
+/// hand-rolled division would drift by ±1 at certain widths and re-
+/// introduce the startup-scrollback race the codebase already fought.
+///
+/// Grid shape is chosen to keep cells roughly the same aspect ratio
+/// as a typical agent pane (~2.5:1 W:H, accounting for the ~2:1
+/// character-cell aspect of a terminal — see `pick_tiled_grid_shape`).
+///
+/// When `pane_count` doesn't perfectly fill the grid the *last row*
+/// is stretched: it has `min(cols, pane_count - (rows-1)*cols)` cells,
+/// each occupying `1 / cells_in_row` of the row width. No empty slots
+/// — empty cells would look like missing panes in a terminal UI.
+///
+/// Returns an empty `Vec` for `pane_count == 0` or a zero-area `area`.
+/// Returns `vec![area]` for `pane_count == 1`.
+fn compute_tiled_layout(area: Rect, pane_count: u16) -> Vec<Rect> {
+    if pane_count == 0 || area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    if pane_count == 1 {
+        return vec![area];
+    }
+
+    let (rows, cols) = pick_tiled_grid_shape(area.width, area.height, pane_count);
+
+    let row_constraints: Vec<Constraint> = (0..rows)
+        .map(|_| Constraint::Ratio(1, rows as u32))
+        .collect();
+    let row_chunks = Layout::vertical(row_constraints).split(area);
+
+    let mut rects = Vec::with_capacity(pane_count as usize);
+    for r in 0..rows {
+        let cells_in_row = if r == rows - 1 {
+            pane_count - r * cols
+        } else {
+            cols
+        };
+        let col_constraints: Vec<Constraint> = (0..cells_in_row)
+            .map(|_| Constraint::Ratio(1, cells_in_row as u32))
+            .collect();
+        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[r as usize]);
+        for c in 0..cells_in_row {
+            rects.push(col_chunks[c as usize]);
+        }
+    }
+    rects
+}
+
+/// Pick `(rows, cols)` for a tiled grid of `pane_count` panes inside
+/// a region of size `width × height`. Aspect-aware so cells stay
+/// roughly readable instead of degenerating into a long vertical
+/// strip (the pre-grid behaviour the user complained about).
+fn pick_tiled_grid_shape(width: u16, height: u16, pane_count: u16) -> (u16, u16) {
+    if pane_count <= 1 {
+        return (1, 1);
+    }
+    // 2 panes is a hard branch on width: every 2-pane workflow is a
+    // side-by-side compare/diff, so default to 1×2 when the terminal
+    // has room (≥ 80 cols, ~40 cols inner per pane) and 2×1 otherwise.
+    // Skipping the aspect formula here keeps behaviour predictable at
+    // the threshold — the formula on its own would also pick 1×2 at
+    // some sub-80 widths, which is surprising.
+    if pane_count == 2 {
+        return if width >= 80 { (1, 2) } else { (2, 1) };
+    }
+    // Target cell W:H ≈ 2.5:1. Character cells are ~2:1 visually, and
+    // agent panes are designed around 80×24-ish (≈3.3:1) — 2.5 is a
+    // compromise that keeps multi-pane grids legible without forcing
+    // panes too narrow to read prompts.
+    let target_aspect: f32 = 2.5;
+    let ideal_cols = ((pane_count as f32 * width as f32) / (target_aspect * height as f32)).sqrt();
+    let cols = (ideal_cols.round() as u16).max(1).min(pane_count);
+    let rows = pane_count.div_ceil(cols);
+    (rows, cols)
+}
+
 /// Identifies which horizontal split a dashboard-style pane lives under.
 /// Used to keep the resize math aligned with the renderer's `Layout` constraints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashboardSplit {
     /// Standard dashboard: 33% session list / 67% panes (see `render_dashboard`).
+    /// In Tiled mode the sidebar is hidden — see `dashboard_panes_area` —
+    /// but this enum variant still drives `panes_area` *computation* for
+    /// the Stacked path. Read with care.
     Dashboard,
-    /// Orchestration tab: 34% role list / 66% panes.
+    /// Orchestration tab: 34% role list / 66% panes. Sidebar is always shown.
     Orchestration,
 }
 
@@ -700,6 +801,43 @@ impl DashboardSplit {
     }
 }
 
+/// Compute the area that dashboard panes will be rendered into for a given
+/// frame size, split, and layout. Returns `(width, height)` of the rect,
+/// matching what `render_dashboard` will hand to `render_terminal_panes`.
+///
+/// For the Dashboard tab in Tiled mode (with panes present) the session-card
+/// sidebar is hidden and panes get the full frame width — see `render_dashboard`.
+/// Every other case uses the split's `right_panel_width` (Layout-solver-based
+/// so it agrees with the renderer to the cell).
+fn dashboard_panes_size(
+    frame_area: Rect,
+    split: DashboardSplit,
+    layout: PaneLayout,
+    has_panes: bool,
+    show_tab_bar: bool,
+) -> (u16, u16) {
+    let chrome_top: u16 = if show_tab_bar { 1 } else { 0 };
+    let main_height = frame_area.height.saturating_sub(chrome_top + 1);
+    let main_width = frame_area.width;
+    if main_height == 0 || main_width == 0 || !has_panes {
+        return (0, 0);
+    }
+    let panes_width = match (split, layout) {
+        // Dashboard + Tiled: hide sidebar, panes get the full frame width.
+        // The grid handles its own subdivision so a single wide region is fine.
+        (DashboardSplit::Dashboard, PaneLayout::Tiled) => main_width,
+        // Stacked dashboard, or any Orchestration layout: panes occupy the right
+        // portion of the horizontal split (`right_panel_width` mirrors ratatui's
+        // Percentage solver, avoiding ±1 drift at edge widths).
+        //
+        // `VerticalStrip` is internal-only (mode-tab side panes); dashboard
+        // code never receives it. We still match the `_` arm safely for
+        // forward-compatibility.
+        _ => split.right_panel_width(main_width),
+    };
+    (panes_width, main_height)
+}
+
 /// Compute the inner `(rows, cols)` for a single dashboard-style pane, matching
 /// what `render_terminal_panes` will draw for the same parameters.
 ///
@@ -708,42 +846,60 @@ impl DashboardSplit {
 /// with the rendered chunk) and the new-pane spawn path (so the agent's first
 /// redraw lands in a vt100 grid the same size as the rendered area —
 /// preventing startup scrollback drift).
+///
+/// `pane_index` is the zero-based slot the pane occupies in the layout.
+/// In Tiled mode different cells can have different sizes (the last row
+/// is stretched to avoid empty slots), so the index is required to pick
+/// the correct cell from the grid. Stacked mode ignores it but takes it
+/// for signature symmetry.
 fn compute_dashboard_pane_inner_size(
     frame_area: Rect,
     split: DashboardSplit,
     layout: PaneLayout,
+    pane_index: u16,
     pane_count: u16,
     is_focused: bool,
     show_tab_bar: bool,
 ) -> (u16, u16) {
     let pane_count = pane_count.max(1);
-    // Mirror render_screen: tab bar row (optional) + main + hints row.
-    let chrome_top: u16 = if show_tab_bar { 1 } else { 0 };
-    let main_height = frame_area.height.saturating_sub(chrome_top + 1);
-    if main_height == 0 || frame_area.width == 0 {
+    let (panes_w, panes_h) =
+        dashboard_panes_size(frame_area, split, layout, pane_count > 0, show_tab_bar);
+    if panes_w == 0 || panes_h == 0 {
         return (0, 0);
     }
-
-    let right_width = split.right_panel_width(frame_area.width);
-    if right_width == 0 {
-        return (0, 0);
-    }
-
-    let chunk_height = match layout {
-        PaneLayout::Tiled => main_height / pane_count,
-        PaneLayout::Stacked => {
-            if is_focused {
-                // Fill(1) gets: total - sum(Length(1)) = total - (count - 1).
-                main_height.saturating_sub(pane_count.saturating_sub(1))
-            } else {
-                1
+    match layout {
+        PaneLayout::Tiled => {
+            // Run the same ratatui Layout solver the renderer uses (via
+            // `compute_tiled_layout`) so the resize side and render side
+            // agree pixel-for-pixel.
+            let area = Rect::new(0, 0, panes_w, panes_h);
+            let rects = compute_tiled_layout(area, pane_count);
+            match rects.get(pane_index as usize) {
+                Some(r) => (r.height.saturating_sub(2), r.width.saturating_sub(2)),
+                None => (0, 0),
             }
         }
-    };
-
-    let rows = chunk_height.saturating_sub(2);
-    let cols = right_width.saturating_sub(2);
-    (rows, cols)
+        PaneLayout::Stacked => {
+            let chunk_h = if is_focused {
+                panes_h.saturating_sub(pane_count.saturating_sub(1))
+            } else {
+                1
+            };
+            (chunk_h.saturating_sub(2), panes_w.saturating_sub(2))
+        }
+        // VerticalStrip is internal-only (mode-tab side panes); dashboard
+        // sizing never receives it. The mode-tab resize path has its own
+        // hand-tuned math (`resize_mode_tab_panes`) — we don't share this
+        // helper there. Compute as if Tiled for forward-compat.
+        PaneLayout::VerticalStrip => {
+            let area = Rect::new(0, 0, panes_w, panes_h);
+            let rects = compute_tiled_layout(area, pane_count);
+            match rects.get(pane_index as usize) {
+                Some(r) => (r.height.saturating_sub(2), r.width.saturating_sub(2)),
+                None => (0, 0),
+            }
+        }
+    }
 }
 
 fn resize_dashboard_panes(
@@ -775,13 +931,14 @@ fn resize_dashboard_panes(
         let show_tab_bar = tab_manager.show_tab_bar();
         let focused = embedded.focused_pane_id();
 
-        for pane_id in &pane_ids {
+        for (idx, pane_id) in pane_ids.iter().enumerate() {
             let is_focused = focused.as_deref() == Some(pane_id.as_str())
                 || (focused.is_none() && pane_id == &pane_ids[0]);
             let (rows, cols) = compute_dashboard_pane_inner_size(
                 area,
                 split,
                 ui.pane_layout,
+                idx as u16,
                 pane_count,
                 is_focused,
                 show_tab_bar,
@@ -800,6 +957,11 @@ fn resize_dashboard_panes(
 /// that create dashboard panes so the agent's first redraw lands in a vt100
 /// grid the same size as the rendered widget — preventing startup
 /// scrollback drift that surfaces as stacked duplicate prompts.
+///
+/// `pane_index` is the slot the new pane will occupy in the layout
+/// — typically `pane_count_after - 1` because new panes append to the
+/// end. Tiled mode needs this so the spawn size matches the actual cell
+/// (the stretched last row makes cells vary in width).
 #[allow(clippy::too_many_arguments)]
 fn create_dashboard_pane_at_layout_size(
     pane: &dyn PaneController,
@@ -807,6 +969,7 @@ fn create_dashboard_pane_at_layout_size(
     layout: PaneLayout,
     show_tab_bar: bool,
     pane_count_after: u16,
+    pane_index: u16,
     is_focused: bool,
     cmd: Option<&str>,
     cwd: Option<&str>,
@@ -816,6 +979,7 @@ fn create_dashboard_pane_at_layout_size(
             frame_area,
             DashboardSplit::Dashboard,
             layout,
+            pane_index,
             pane_count_after,
             is_focused,
             show_tab_bar,
@@ -1076,6 +1240,7 @@ fn dispatch_delegate_events(
                     frame_area,
                     DashboardSplit::Orchestration,
                     ui.pane_layout,
+                    role_idx as u16,
                     role_count,
                     role_idx == start_idx,
                     tab_manager.show_tab_bar(),
@@ -2175,33 +2340,12 @@ fn focus_deck(
                         "PaneInput mode — type to interact, Ctrl+d for dashboard".to_string(),
                         std::time::Instant::now(),
                     ));
-                    // Recompute PTY dimensions after focus change so stacked
-                    // panes get the correct expanded/collapsed sizes.
-                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-                        let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
-                        let right_width = (term_w * 67 / 100).saturating_sub(2);
-                        // Account for UI chrome (tab bar + info bar + hints bar).
-                        // Use 3 as safe default; tab bar is shown whenever tabs exist.
-                        let usable_h = term_h.saturating_sub(3);
-                        let pane_ids = embedded.pane_ids();
-                        let pane_count = pane_ids.len() as u16;
-                        for pid in &pane_ids {
-                            let is_focused = pid == pane_id;
-                            let rows = match ui.pane_layout {
-                                PaneLayout::Tiled => (usable_h / pane_count).saturating_sub(2),
-                                PaneLayout::Stacked => {
-                                    if is_focused {
-                                        usable_h.saturating_sub(2 + pane_count.saturating_sub(1))
-                                    } else {
-                                        0
-                                    }
-                                }
-                            };
-                            if rows > 0 {
-                                let _ = embedded.resize_pane_pty(pid, rows, right_width);
-                            }
-                        }
-                    }
+                    // Caller is responsible for calling `resize_dashboard_panes`
+                    // after `focus_deck` returns — Stacked layouts shift visible
+                    // height between focused/unfocused panes, and the new Tiled
+                    // grid doesn't depend on focus at all. Both call sites
+                    // (the dashboard card click handler and the `1`–`9`
+                    // keyboard shortcut handler) already do this.
                 }
                 Err(PaneError::CommandFailed(ref msg)) => {
                     state.blocking_write().sessions.remove(*sid);
@@ -2889,6 +3033,7 @@ pub fn run_tui(
                 restore_layout,
                 restore_show_tab_bar,
                 predicted_dashboard_count,
+                dashboard_panes_started.saturating_sub(1),
                 is_first_dashboard,
                 cmd,
                 Some(&saved_pane.dir),
@@ -3010,6 +3155,7 @@ pub fn run_tui(
                                 restore_layout,
                                 restore_show_tab_bar,
                                 count_after,
+                                count_after.saturating_sub(1),
                                 false,
                                 cmd,
                                 Some(&saved_pane.dir),
@@ -3067,6 +3213,7 @@ pub fn run_tui(
                         restore_layout,
                         restore_show_tab_bar,
                         count_after,
+                        count_after.saturating_sub(1),
                         false,
                         cmd,
                         Some(&saved_pane.dir),
@@ -3600,6 +3747,49 @@ pub fn run_tui(
                     }
                 }
 
+                // Tiled-pane click-to-focus: when the sidebar is hidden, this
+                // is the primary way to switch focus between visible panes
+                // (the row of `1`–`9` shortcuts targets cards which are no
+                // longer visible). Clicks landing on the *already-focused*
+                // pane intentionally fall through so the normal Ctrl+click
+                // / drag-select / scroll handlers downstream still see them.
+                if !click_handled
+                    && matches!(ui.mode, UiMode::Normal | UiMode::PaneInput)
+                    && matches!(
+                        mouse.kind,
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                    )
+                    && matches!(tab_manager.active_tab(), Tab::Dashboard)
+                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                {
+                    let focused_id = embedded.focused_pane_id();
+                    let target = ui.dashboard_pane_rects.iter().find_map(|(pid, rect)| {
+                        if mouse.column >= rect.x
+                            && mouse.column < rect.x.saturating_add(rect.width)
+                            && mouse.row >= rect.y
+                            && mouse.row < rect.y.saturating_add(rect.height)
+                        {
+                            Some(pid.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(target_id) = target
+                        && focused_id.as_deref() != Some(target_id.as_str())
+                    {
+                        let _ = pane.focus_pane(&target_id);
+                        // Entering PaneInput matches the keyboard `1`–`9`
+                        // shortcut behaviour: clicking a visible pane should
+                        // make it immediately receive keystrokes.
+                        if ui.mode == UiMode::Normal {
+                            ui.mode = UiMode::PaneInput;
+                        }
+                        let area = terminal.get_frame().area();
+                        resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
+                        click_handled = true;
+                    }
+                }
+
                 if !click_handled
                     && !side_scrolled
                     && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
@@ -4099,52 +4289,23 @@ pub fn run_tui(
                         ui.pane_layout = match ui.pane_layout {
                             PaneLayout::Stacked => PaneLayout::Tiled,
                             PaneLayout::Tiled => PaneLayout::Stacked,
+                            // VerticalStrip is internal-only; it should never
+                            // be stored on UiState. Fall back to Stacked to
+                            // preserve the toggle's invariant.
+                            PaneLayout::VerticalStrip => PaneLayout::Stacked,
                         };
                         let mode_name = match ui.pane_layout {
                             PaneLayout::Stacked => "stacked",
                             PaneLayout::Tiled => "tiled",
+                            PaneLayout::VerticalStrip => "stacked",
                         };
-                        // Resize PTYs to match new layout dimensions.
-                        // Mode tabs use 50% width; dashboard uses 67%.
-                        if let Some(embedded) =
-                            pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                        {
-                            let frame_area = terminal.get_frame().area();
-                            let is_mode_tab = tab_manager.active_mode_name().is_some();
-                            let pane_width = if is_mode_tab {
-                                (frame_area.width / 2).saturating_sub(2)
-                            } else {
-                                (frame_area.width * 67 / 100).saturating_sub(2)
-                            };
-                            let pane_ids = embedded.pane_ids();
-                            let pane_count = pane_ids.len() as u16;
-                            for pane_id in &pane_ids {
-                                let rows = match ui.pane_layout {
-                                    PaneLayout::Tiled => frame_area
-                                        .height
-                                        .checked_div(pane_count)
-                                        .unwrap_or(0)
-                                        .saturating_sub(2),
-                                    PaneLayout::Stacked => {
-                                        let is_focused = embedded.focused_pane_id().as_deref()
-                                            == Some(pane_id.as_str());
-                                        if is_focused
-                                            || (embedded.focused_pane_id().is_none()
-                                                && pane_id == &pane_ids[0])
-                                        {
-                                            frame_area
-                                                .height
-                                                .saturating_sub(2 + pane_count.saturating_sub(1))
-                                        } else {
-                                            0
-                                        }
-                                    }
-                                };
-                                if rows > 0 {
-                                    let _ = embedded.resize_pane_pty(pane_id, rows, pane_width);
-                                }
-                            }
-                        }
+                        // Resize PTYs to match the new layout. resize_dashboard_panes
+                        // knows about the Tiled hide-sidebar rule and the per-pane
+                        // index needed for stretched-last-row grid cells — all the
+                        // things the previous hand-math `(frame_area.width * 67 / 100)`
+                        // / `height / count` did wrong.
+                        let frame_area = terminal.get_frame().area();
+                        resize_dashboard_panes(&*pane, &ui, &tab_manager, frame_area);
                         ui.status_message =
                             Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
                         shortcut_handled = true;
@@ -4201,6 +4362,12 @@ pub fn run_tui(
                                 st.unregister_pane(&closed_pane_id);
                                 drop(st);
                                 ui.pane_metadata.remove(&closed_pane_id);
+                                // Reflow remaining panes — in Tiled the grid
+                                // shape can change (e.g. 4→3 might collapse
+                                // 2×2 to 1×3), and in Stacked the focused
+                                // pane gains a title-row's worth of height.
+                                let area = terminal.get_frame().area();
+                                resize_dashboard_panes(&*pane, &ui, &tab_manager, area);
                             }
                             if ui.mode == UiMode::PaneInput {
                                 ui.mode = UiMode::Normal;
@@ -4525,6 +4692,7 @@ pub fn run_tui(
                                         frame_area,
                                         DashboardSplit::Orchestration,
                                         ui.pane_layout,
+                                        i as u16,
                                         role_count,
                                         i == start_idx,
                                         tab_manager.show_tab_bar(),
@@ -4641,6 +4809,7 @@ pub fn run_tui(
                                     ui.pane_layout,
                                     tab_manager.show_tab_bar(),
                                     count_after,
+                                    count_after.saturating_sub(1),
                                     true,
                                     cmd,
                                     Some(&dir_str),
@@ -5110,6 +5279,12 @@ fn render_frame(
         ..
     } = tab_view
     {
+        // Clear stale Dashboard pane-rects so that a quick tab-switch ⇒
+        // click sequence (between the tab change and the next Dashboard
+        // render) can't hit-test against rects from the previous Dashboard
+        // render. The Dashboard click-to-focus block is gated on
+        // `Tab::Dashboard`, but clearing here is a cheap belt-and-braces.
+        ui.dashboard_pane_rects.clear();
         render_mode_tab(
             frame,
             ui,
@@ -5134,8 +5309,19 @@ fn render_frame(
                 .into_iter()
                 .filter(|id| !exclude_pane_ids.contains(id))
                 .collect();
+            // In Tiled mode with at least one pane, hide the session-card
+            // sidebar — the grid uses the full frame width. Switching back
+            // to Stacked (or closing the last pane) restores the 33/67 split.
+            let hide_sidebar = matches!(pane_layout, PaneLayout::Tiled) && !pane_ids.is_empty();
             let (dashboard_area, panes_area) = if pane_ids.is_empty() {
                 (main_area, None)
+            } else if hide_sidebar {
+                // Zero-area sidebar rect (renderers skip empty rects) +
+                // full-width panes area. Cleanest way to keep the
+                // downstream `if dashboard_area.height > 0` guards happy
+                // without a parallel code path.
+                let empty = Rect::new(main_area.x, main_area.y, 0, 0);
+                (empty, Some(main_area))
             } else {
                 let chunks =
                     Layout::horizontal([Constraint::Percentage(33), Constraint::Percentage(67)])
@@ -5164,6 +5350,36 @@ fn render_frame(
 
     // Orchestration tabs use the same dashboard card rendering as the main dashboard.
 
+    // Sidebar-hidden short-circuit: Dashboard + Tiled with panes uses the full
+    // frame for the pane grid. Skip all card / stats / no-sessions rendering;
+    // jump straight to the terminal panes + bottom bar + overlays. This avoids
+    // running density math, idle-art updates, etc. against a zero-area sidebar.
+    if dashboard_area.width == 0 || dashboard_area.height == 0 {
+        render_bottom_bar(frame, ui, hints_area, has_pane_control, tab_bar.show, false);
+        if let Some(right) = panes_area {
+            ui.focused_pane_rect = render_terminal_panes(
+                frame,
+                embedded,
+                right,
+                &pane_ids,
+                pane_layout,
+                &ui.pane_display_names,
+                &ui.selection,
+                palette,
+                None,
+                Some(&mut ui.dashboard_pane_rects),
+            );
+        } else {
+            ui.dashboard_pane_rects.clear();
+        }
+        // Cards are not rendered in this branch — clear any stale rects so a
+        // leftover click region from the previous layout can't hijack mouse
+        // events.
+        ui.card_rects.clear();
+        render_overlays(frame, ui, active_mode_name, palette);
+        return;
+    }
+
     if state.sessions.is_empty() {
         let vertical = Layout::vertical([
             Constraint::Fill(1),
@@ -5190,7 +5406,10 @@ fn render_frame(
                 &ui.selection,
                 palette,
                 None,
+                Some(&mut ui.dashboard_pane_rects),
             );
+        } else {
+            ui.dashboard_pane_rects.clear();
         }
 
         render_overlays(frame, ui, active_mode_name, palette);
@@ -5278,7 +5497,10 @@ fn render_frame(
                 &ui.selection,
                 palette,
                 None,
+                Some(&mut ui.dashboard_pane_rects),
             );
+        } else {
+            ui.dashboard_pane_rects.clear();
         }
         render_overlays(frame, ui, active_mode_name, palette);
         return;
@@ -5373,7 +5595,10 @@ fn render_frame(
             &ui.selection,
             palette,
             None,
+            Some(&mut ui.dashboard_pane_rects),
         );
+    } else {
+        ui.dashboard_pane_rects.clear();
     }
 
     render_overlays(frame, ui, active_mode_name, palette);
@@ -5423,7 +5648,15 @@ fn render_terminal_panes(
     selection: &Option<TextSelection>,
     palette: ColorPalette,
     visual_focus_id: Option<&str>,
+    out_pane_rects: Option<&mut Vec<(String, Rect)>>,
 ) -> Option<Rect> {
+    let mut collect = out_pane_rects;
+    if let Some(buf) = collect.as_deref_mut() {
+        // Caller wants per-pane rects (for click hit-testing). Reset each
+        // frame so stale rects from earlier renders never leak into mouse
+        // handling.
+        buf.clear();
+    }
     let ctrl = embedded?;
     if pane_ids.is_empty() {
         return None;
@@ -5452,12 +5685,46 @@ fn render_terminal_panes(
 
     match layout {
         PaneLayout::Tiled => {
+            // Use the shared grid helper (also used by the resize/spawn side)
+            // so each rendered cell exactly matches the size the pane's vt100
+            // parser was sized to. Mismatched sizing here is what historically
+            // produced stacked duplicate prompts on first paint.
+            let chunks = compute_tiled_layout(area, pane_ids.len() as u16);
+            for (i, pane_id) in pane_ids.iter().enumerate() {
+                let Some(rect) = chunks.get(i).copied() else {
+                    continue;
+                };
+                if let Some(buf) = collect.as_deref_mut() {
+                    buf.push((pane_id.clone(), rect));
+                }
+                if let Some(screen) = ctrl.get_screen(pane_id) {
+                    let focused = focused_id.as_deref() == Some(pane_id.as_str());
+                    let title = pane_name(pane_id);
+                    let widget = TerminalWidget::new(Arc::clone(&screen), title, focused, palette);
+                    if focused {
+                        focused_pane_rect = Some(rect);
+                        focused_screen = Some(screen);
+                    }
+                    frame.render_widget(widget, rect);
+                }
+            }
+        }
+        PaneLayout::VerticalStrip => {
+            // Uniform vertical strip: every pane gets 1/N of the height,
+            // all visible simultaneously regardless of focus. Used for
+            // mode-tab side panes — the matching resize math lives in
+            // `resize_mode_tab_panes` and the matching click hit-test
+            // lives in `render_mode_tab` (`side_pane_rects`).
+            let count = pane_ids.len() as u32;
             let constraints: Vec<Constraint> = pane_ids
                 .iter()
-                .map(|_| Constraint::Ratio(1, pane_ids.len() as u32))
+                .map(|_| Constraint::Ratio(1, count))
                 .collect();
             let chunks = Layout::vertical(constraints).split(area);
             for (i, pane_id) in pane_ids.iter().enumerate() {
+                if let Some(buf) = collect.as_deref_mut() {
+                    buf.push((pane_id.clone(), chunks[i]));
+                }
                 if let Some(screen) = ctrl.get_screen(pane_id) {
                     let focused = focused_id.as_deref() == Some(pane_id.as_str());
                     let title = pane_name(pane_id);
@@ -5496,6 +5763,9 @@ fn render_terminal_panes(
             for (i, pane_id) in pane_ids.iter().enumerate() {
                 let is_expanded = focused_idx == Some(i);
                 let title = pane_name(pane_id);
+                if let Some(buf) = collect.as_deref_mut() {
+                    buf.push((pane_id.clone(), chunks[i]));
+                }
                 if is_expanded {
                     if let Some(screen) = ctrl.get_screen(pane_id) {
                         let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
@@ -5627,6 +5897,7 @@ fn render_mode_tab(
             &ui.selection,
             palette,
             agent_visual_focus,
+            None,
         );
         if rect.is_some() {
             ui.focused_pane_rect = rect;
@@ -5640,11 +5911,12 @@ fn render_mode_tab(
             embedded,
             side_area,
             side_pane_ids,
-            PaneLayout::Tiled,
+            PaneLayout::VerticalStrip,
             &ui.pane_display_names,
             &ui.selection,
             palette,
             side_visual_focus.as_deref(),
+            None,
         );
         // Use side pane rect when a side pane is visually focused, or as fallback.
         if side_visual_focus.is_some() || ui.focused_pane_rect.is_none() {
@@ -10788,21 +11060,33 @@ mod tests {
 
     #[test]
     fn compute_dashboard_pane_inner_size_tiled_two_panes() {
-        // width=100, height=30, no tab bar:
-        //   chrome_top = 0, main_height = 30 - 0 - 1 = 29
-        //   right_width = 100 - (100 * 33 / 100) = 100 - 33 = 67
-        //   tiled, 2 panes: chunk_h = 29 / 2 = 14
-        //   inner: rows = 14 - 2 = 12, cols = 67 - 2 = 65
+        // width=100, height=30, Dashboard tab + Tiled:
+        //   sidebar is hidden — panes_width = 100 (full main width)
+        //   main_height = 30 - 0 - 1 = 29
+        //   2 panes at width >= 80 → 1×2 side-by-side grid (special case)
+        //   each cell = 50×29 → inner: rows = 27, cols = 48
         let area = Rect::new(0, 0, 100, 30);
         let (rows, cols) = compute_dashboard_pane_inner_size(
             area,
             DashboardSplit::Dashboard,
             PaneLayout::Tiled,
+            0,
             2,
             false,
             false,
         );
-        assert_eq!((rows, cols), (12, 65));
+        assert_eq!((rows, cols), (27, 48));
+        // Second pane in the same row — same dimensions.
+        let (rows2, cols2) = compute_dashboard_pane_inner_size(
+            area,
+            DashboardSplit::Dashboard,
+            PaneLayout::Tiled,
+            1,
+            2,
+            false,
+            false,
+        );
+        assert_eq!((rows2, cols2), (27, 48));
     }
 
     #[test]
@@ -10813,6 +11097,7 @@ mod tests {
             area,
             DashboardSplit::Dashboard,
             PaneLayout::Stacked,
+            0,
             3,
             true,
             false,
@@ -10828,6 +11113,7 @@ mod tests {
             area,
             DashboardSplit::Dashboard,
             PaneLayout::Stacked,
+            1,
             3,
             false,
             false,
@@ -10838,13 +11124,15 @@ mod tests {
 
     #[test]
     fn compute_dashboard_pane_inner_size_show_tab_bar_subtracts_a_row() {
-        // height=11. Without tab bar: main_height = 10, chunk = 5, rows = 3.
-        // With tab bar:                main_height = 9,  chunk = 4, rows = 2.
+        // Dashboard + Tiled with 2 panes → 1×2 grid filling 100 wide.
+        // height=11. Without tab bar: main_h = 10, cell = 50×10, inner rows = 8.
+        // With tab bar:                main_h = 9,  cell = 50×9,  inner rows = 7.
         let area = Rect::new(0, 0, 100, 11);
         let (without, _) = compute_dashboard_pane_inner_size(
             area,
             DashboardSplit::Dashboard,
             PaneLayout::Tiled,
+            0,
             2,
             false,
             false,
@@ -10853,12 +11141,13 @@ mod tests {
             area,
             DashboardSplit::Dashboard,
             PaneLayout::Tiled,
+            0,
             2,
             false,
             true,
         );
-        assert_eq!(without, 3);
-        assert_eq!(with_bar, 2);
+        assert_eq!(without, 8);
+        assert_eq!(with_bar, 7);
     }
 
     #[test]
@@ -10869,6 +11158,7 @@ mod tests {
             area,
             DashboardSplit::Orchestration,
             PaneLayout::Stacked,
+            0,
             1,
             true,
             false,
@@ -10884,6 +11174,7 @@ mod tests {
                 zero_width,
                 DashboardSplit::Dashboard,
                 PaneLayout::Tiled,
+                0,
                 2,
                 false,
                 false
@@ -10897,6 +11188,7 @@ mod tests {
                 zero_main,
                 DashboardSplit::Dashboard,
                 PaneLayout::Tiled,
+                0,
                 2,
                 false,
                 true
@@ -10924,6 +11216,7 @@ mod tests {
                 area,
                 DashboardSplit::Dashboard,
                 PaneLayout::Stacked,
+                0,
                 1,
                 true,
                 false,
@@ -10936,6 +11229,222 @@ mod tests {
                 renderer_right_width
             );
         }
+    }
+
+    // ----- Tiled grid (compute_tiled_layout / pick_tiled_grid_shape) -----
+    //
+    // Exercise the new aspect-ratio-aware 2-D grid that replaced the
+    // legacy "stack everything vertically" tiled layout.
+
+    #[test]
+    fn pick_tiled_grid_shape_zero_or_one_pane() {
+        assert_eq!(pick_tiled_grid_shape(200, 50, 0), (1, 1));
+        assert_eq!(pick_tiled_grid_shape(200, 50, 1), (1, 1));
+    }
+
+    #[test]
+    fn pick_tiled_grid_shape_two_panes_wide_terminal_is_side_by_side() {
+        // Special case: 2 panes in any terminal >= 80 cols → 1×2, even when
+        // the aspect formula would round to 1 col on a tall narrow window.
+        assert_eq!(pick_tiled_grid_shape(120, 40, 2), (1, 2));
+        assert_eq!(pick_tiled_grid_shape(80, 40, 2), (1, 2));
+        assert_eq!(pick_tiled_grid_shape(80, 200, 2), (1, 2));
+    }
+
+    #[test]
+    fn pick_tiled_grid_shape_two_panes_narrow_terminal_stacks() {
+        // Below the 80-col threshold the special case turns off and the
+        // aspect formula takes over — which picks 1 col for a narrow window.
+        assert_eq!(pick_tiled_grid_shape(60, 40, 2), (2, 1));
+    }
+
+    #[test]
+    fn pick_tiled_grid_shape_four_panes_balances_to_square() {
+        // 4 panes on a roughly proportional terminal should pick a 2×2 grid.
+        assert_eq!(pick_tiled_grid_shape(200, 80, 4), (2, 2));
+    }
+
+    #[test]
+    fn pick_tiled_grid_shape_nine_panes_balances_to_3x3() {
+        assert_eq!(pick_tiled_grid_shape(200, 80, 9), (3, 3));
+    }
+
+    #[test]
+    fn pick_tiled_grid_shape_five_panes_wide_terminal() {
+        // 5 panes wide terminal → 2 rows of (3, 2) — last row stretches.
+        let (rows, cols) = pick_tiled_grid_shape(240, 60, 5);
+        assert_eq!(rows, 2);
+        assert_eq!(cols, 3);
+    }
+
+    #[test]
+    fn compute_tiled_layout_empty_returns_no_rects() {
+        assert!(compute_tiled_layout(Rect::new(0, 0, 100, 30), 0).is_empty());
+        assert!(compute_tiled_layout(Rect::new(0, 0, 0, 30), 4).is_empty());
+        assert!(compute_tiled_layout(Rect::new(0, 0, 100, 0), 4).is_empty());
+    }
+
+    #[test]
+    fn compute_tiled_layout_one_pane_fills_area() {
+        let area = Rect::new(0, 0, 100, 30);
+        let rects = compute_tiled_layout(area, 1);
+        assert_eq!(rects, vec![area]);
+    }
+
+    #[test]
+    fn compute_tiled_layout_two_panes_wide_terminal_side_by_side() {
+        let area = Rect::new(0, 0, 100, 30);
+        let rects = compute_tiled_layout(area, 2);
+        assert_eq!(rects.len(), 2);
+        // 1 row of 30 tall, 2 cols of 50 wide each.
+        assert_eq!(rects[0].height, 30);
+        assert_eq!(rects[1].height, 30);
+        assert_eq!(rects[0].width + rects[1].width, 100);
+        // Cells should be the same width (or differ by 1 from rounding).
+        assert!(rects[0].width.abs_diff(rects[1].width) <= 1);
+    }
+
+    #[test]
+    fn compute_tiled_layout_three_panes_last_row_stretches() {
+        // 3 panes at 200×80: aspect formula → 2 cols, 2 rows.
+        // Row 0: 2 cells of 100 wide. Row 1: 1 cell stretched to 200 wide.
+        let area = Rect::new(0, 0, 200, 80);
+        let rects = compute_tiled_layout(area, 3);
+        assert_eq!(rects.len(), 3);
+        // Row 0
+        assert_eq!(rects[0].y, 0);
+        assert_eq!(rects[1].y, 0);
+        assert_eq!(rects[0].width + rects[1].width, 200);
+        // Row 1 — single stretched cell taking the full width.
+        assert_eq!(rects[2].width, 200);
+        assert_eq!(rects[2].x, 0);
+        // Heights distribute evenly across 2 rows.
+        assert_eq!(rects[0].height + rects[2].height, 80);
+    }
+
+    #[test]
+    fn compute_tiled_layout_every_pane_gets_nonzero_rect() {
+        // Sanity: for a range of plausible pane counts on a reasonable
+        // terminal, no pane is left with a zero-area rect.
+        let area = Rect::new(0, 0, 200, 60);
+        for n in 1u16..=12 {
+            let rects = compute_tiled_layout(area, n);
+            assert_eq!(rects.len() as u16, n, "n={n}");
+            for (i, r) in rects.iter().enumerate() {
+                assert!(r.width > 0 && r.height > 0, "n={n}, pane {i}: {r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn compute_tiled_layout_renderer_and_resizer_agree_at_awkward_widths() {
+        // Regression guard against the class of bug the rubber-duck
+        // critique flagged: hand-rolled width math drifts from ratatui's
+        // Layout solver at certain widths. Because the resizer (via
+        // compute_dashboard_pane_inner_size) and the renderer (via
+        // render_terminal_panes) both go through compute_tiled_layout,
+        // they must produce identical rects.
+        for w in [79u16, 80, 81, 100, 101, 113, 137, 200] {
+            for h in [20u16, 24, 30, 50] {
+                for n in [2u16, 3, 4, 5, 6, 9] {
+                    let area = Rect::new(0, 0, w, h);
+                    let renderer_rects = compute_tiled_layout(area, n);
+                    for (i, r) in renderer_rects.iter().enumerate() {
+                        let inner_h = r.height.saturating_sub(2);
+                        let inner_w = r.width.saturating_sub(2);
+                        // Sized via the helper used by resize_dashboard_panes.
+                        // To test in isolation we pass a frame_area that
+                        // yields panes_area exactly == area: 0 chrome_top,
+                        // hints subtracts 1, panes_width = main_width
+                        // (Dashboard+Tiled hide-sidebar branch).
+                        let frame = Rect::new(0, 0, w, h.saturating_add(1));
+                        let (rrows, rcols) = compute_dashboard_pane_inner_size(
+                            frame,
+                            DashboardSplit::Dashboard,
+                            PaneLayout::Tiled,
+                            i as u16,
+                            n,
+                            false,
+                            false,
+                        );
+                        assert_eq!(
+                            (rrows, rcols),
+                            (inner_h, inner_w),
+                            "drift at w={w} h={h} n={n} pane={i}: \
+                             rect={r:?} renderer_inner=({inner_h},{inner_w}) \
+                             resizer=({rrows},{rcols})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_panes_size_tiled_dashboard_hides_sidebar() {
+        // Dashboard + Tiled + has_panes → full frame width, no 33/67 split.
+        let frame = Rect::new(0, 0, 200, 60);
+        let (w, _) = dashboard_panes_size(
+            frame,
+            DashboardSplit::Dashboard,
+            PaneLayout::Tiled,
+            true,
+            false,
+        );
+        assert_eq!(w, 200);
+    }
+
+    #[test]
+    fn dashboard_panes_size_stacked_dashboard_keeps_67pct_split() {
+        // Dashboard + Stacked → right_panel_width via ratatui (~67% of 200 = 134).
+        let frame = Rect::new(0, 0, 200, 60);
+        let (w, _) = dashboard_panes_size(
+            frame,
+            DashboardSplit::Dashboard,
+            PaneLayout::Stacked,
+            true,
+            false,
+        );
+        assert!(w < 200, "stacked should keep sidebar, got width {w}");
+        assert!((130..=140).contains(&w), "67% of 200 ≈ 134, got {w}");
+    }
+
+    #[test]
+    fn dashboard_panes_size_orchestration_keeps_66pct_in_either_layout() {
+        // Per rubber-duck blocking #4: Orchestration must keep its
+        // 34/66 split regardless of pane_layout — hiding the role sidebar
+        // would break the workflow.
+        let frame = Rect::new(0, 0, 200, 60);
+        let (w_stacked, _) = dashboard_panes_size(
+            frame,
+            DashboardSplit::Orchestration,
+            PaneLayout::Stacked,
+            true,
+            false,
+        );
+        let (w_tiled, _) = dashboard_panes_size(
+            frame,
+            DashboardSplit::Orchestration,
+            PaneLayout::Tiled,
+            true,
+            false,
+        );
+        assert_eq!(w_stacked, w_tiled);
+        assert!(w_stacked < 200);
+    }
+
+    #[test]
+    fn dashboard_panes_size_no_panes_returns_zero() {
+        // has_panes=false → no panes area; resize loop should early-return.
+        let frame = Rect::new(0, 0, 200, 60);
+        let (w, h) = dashboard_panes_size(
+            frame,
+            DashboardSplit::Dashboard,
+            PaneLayout::Tiled,
+            false,
+            false,
+        );
+        assert_eq!((w, h), (0, 0));
     }
 
     // ----- Paste-event dedup / fallback decision -------------------------
