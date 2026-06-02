@@ -2690,11 +2690,16 @@ fn handle_bookmark_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                             .or_else(|_| std::env::var("HOME"))
                             .unwrap_or_else(|_| ".".to_string())
                     });
-                let name = if b.note.is_empty() {
-                    b.session_name.clone()
-                } else {
-                    b.note.clone()
-                };
+                // Use the bookmark's `session_name` (the renamed card name,
+                // Copilot summary, or first prompt — whatever the bookmark
+                // modal captured) as the new card's name. The note is a
+                // free-form description ("app creation investigation"),
+                // not a name — never put a paragraph in the card title.
+                // If `session_name` is empty (hand-edited bookmark file,
+                // legacy data), let `name` flow through as empty so the
+                // card render falls back to `agent · id` rather than
+                // pasting the note in.
+                let name = b.session_name.clone();
                 ui.mode = UiMode::Normal;
                 return KeyResult::NewPane(NewPaneRequest {
                     dir: PathBuf::from(cwd),
@@ -8349,6 +8354,72 @@ mod tests {
             target.session_name, "fallback prompt",
             "blank rename must fall through to the first prompt"
         );
+    }
+
+    /// Pressing Enter in the bookmark-picker must use the bookmark's
+    /// `session_name` (the card name / Copilot summary captured at
+    /// bookmark-create time) as the new pane's name — never the
+    /// free-form `note` description, which can be a long paragraph.
+    /// Regression guard for the bug where opening a bookmark put the
+    /// user's bookmark note in the card title.
+    #[test]
+    fn open_bookmark_picker_uses_session_name_not_note() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::BookmarkPicker;
+        ui.bookmark_picker_index = 0;
+        ui.bookmarks = vec![crate::bookmark::Bookmark {
+            session_id: "deadbeef-cafe-1234".to_string(),
+            session_name: "my-feature-branch".to_string(),
+            note: "investigating intermittent build failures in CI \
+                   when bumping rustc — long descriptive paragraph"
+                .to_string(),
+            updated_at: Utc::now(),
+        }];
+
+        let result =
+            handle_bookmark_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+
+        match result {
+            KeyResult::NewPane(req) => {
+                assert_eq!(
+                    req.name, "my-feature-branch",
+                    "card name must be the bookmark's session_name, never the note"
+                );
+                assert_eq!(req.command, "copilot --resume deadbeef-cafe-1234");
+            }
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    /// Edge case: a bookmark file hand-edited to have an empty
+    /// `session_name` should still NOT use the note as the card name.
+    /// Better to flow through an empty name and let the card render
+    /// fall back to `agent · id` than to paste a paragraph in the title.
+    #[test]
+    fn open_bookmark_picker_with_empty_session_name_does_not_use_note() {
+        let mut ui = default_ui();
+        ui.mode = UiMode::BookmarkPicker;
+        ui.bookmark_picker_index = 0;
+        ui.bookmarks = vec![crate::bookmark::Bookmark {
+            session_id: "deadbeef-cafe-1234".to_string(),
+            session_name: String::new(),
+            note: "this is just a note, not a name".to_string(),
+            updated_at: Utc::now(),
+        }];
+
+        let result =
+            handle_bookmark_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+
+        match result {
+            KeyResult::NewPane(req) => {
+                assert!(
+                    req.name.is_empty(),
+                    "empty session_name must flow through as empty, not fall back to note (got {:?})",
+                    req.name
+                );
+            }
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
     }
 
     #[test]
