@@ -2686,9 +2686,9 @@ fn handle_bookmark_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                     .and_then(|i| i.cwd.clone())
                     .filter(|p| std::path::Path::new(p).is_dir())
                     .unwrap_or_else(|| {
-                        std::env::var("USERPROFILE")
-                            .or_else(|_| std::env::var("HOME"))
-                            .unwrap_or_else(|_| ".".to_string())
+                        // Same fallback chain as the rest of the codebase
+                        // (USERPROFILE → HOME → HOMEDRIVE+HOMEPATH → /).
+                        crate::config::dirs_home().to_string_lossy().into_owned()
                     });
                 // Use the bookmark's `session_name` (the renamed card name,
                 // Copilot summary, or first prompt — whatever the bookmark

@@ -187,6 +187,13 @@ enum ConfigAction {
 }
 
 fn main() -> ExitCode {
+    // One-time migration for users whose pre-1.x configs landed at
+    // `/.config/dot-agent-deck/` (Windows without `HOME` set). Runs
+    // before any subcommand dispatch so `config get/set`, `bookmarks
+    // list`, etc. all see the post-migration layout. Idempotent and
+    // fast (one stat call) once migration has been done.
+    dot_agent_deck::config::migrate_legacy_config_dir();
+
     let keys_help = dot_agent_deck::config::config_keys_help();
     let cmd = Cli::command().mut_subcommand("config", |c| {
         c.mut_subcommand("get", |g| {

@@ -38,13 +38,11 @@ const TIMEOUT_PRE_TOOL_USE_SEC: u32 = 120;
 const CONFIG_FILE_NAME: &str = "dot-agent-deck.json";
 
 fn home_dir() -> PathBuf {
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        return PathBuf::from(profile);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home);
-    }
-    PathBuf::from(".")
+    // Delegate to the shared resolver so all home-directory lookups
+    // in this codebase agree on ordering (USERPROFILE first, then
+    // HOME, then HOMEDRIVE+HOMEPATH). See `config::dirs_home` for
+    // the full fallback chain.
+    crate::config::dirs_home()
 }
 
 fn copilot_hooks_dir() -> PathBuf {

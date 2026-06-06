@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -653,37 +653,99 @@ fn strip_resume_flag(command: &str) -> String {
     tokens.join(" ")
 }
 
-/// Returns `true` if `command` is a bare invocation of the binary for
-/// `agent`, with no arguments other than an optional `--resume <id>`
-/// pair. Path-aware: a fully-qualified `C:\…\copilot.exe` is accepted.
+/// Known launcher / shim wrappers that may precede the agent binary
+/// while still being safe to round-trip. Single-token only — anything
+/// requiring its own arguments (e.g. `cmd /c …`, `pnpm dlx …`) is
+/// rejected because we can't tell which arg belongs to which layer.
+///
+/// `agency`/`agenchy` are the Microsoft internal Copilot wrappers most
+/// commonly used to expose hook events to the deck. The npm-ecosystem
+/// runners are included because they're the obvious cross-machine
+/// install path for `claude` / `copilot` binaries.
+const KNOWN_WRAPPER_NAMES: &[&str] = &["agency", "agenchy", "npx", "pnpx", "bunx"];
+
+/// Conservative shell-metachar denylist for tokens we'd splice back
+/// into a PTY command line. Matches the spirit of `is_safe_session_id`
+/// but applied at the token level rather than the value level.
+fn contains_shell_metachar(tok: &str) -> bool {
+    tok.chars().any(|c| {
+        matches!(
+            c,
+            '|' | '&' | ';' | '>' | '<' | '`' | '$' | '"' | '\'' | '(' | ')' | '\n' | '\r'
+        )
+    })
+}
+
+/// Returns `true` if `command` is a safely-rewritable launch shape for
+/// `agent`. Specifically, after stripping any existing `--resume <id>`
+/// pair, the remaining tokens must match the pattern
+///
+/// ```text
+///   [wrapper]* <agent_binary> [--flag …]*
+/// ```
+///
+/// where:
+///   - each `wrapper` is one of `KNOWN_WRAPPER_NAMES` (basename match,
+///     case-insensitive, path-aware);
+///   - `agent_binary` is the configured binary for `agent`
+///     (`copilot`/`claude`, basename match, path-aware so `C:\…\copilot.exe`
+///     and `/usr/local/bin/claude` both qualify);
+///   - each post-agent token starts with `-` (flag-style only — no
+///     positional sub-commands, no space-separated flag values like
+///     `--model gpt-5`; use `--model=gpt-5` for those);
+///   - no token contains shell metacharacters.
 ///
 /// This is the gate workspace-restore uses before rewriting a command
-/// to inject `--resume <session_id>`. Anything more complex (custom
-/// flags, wrappers like `npx copilot` or `cmd /c copilot`, quoted args,
-/// pipelines) is left untouched so we don't silently corrupt a power
-/// user's command line.
+/// to inject `--resume <session_id>` at the end. Anything more complex
+/// (unknown wrapper, quoted args, pipelines, positional subcommands)
+/// is left untouched so we don't silently corrupt a power user's
+/// command line.
 fn is_simple_agent_invocation(command: &str, agent: &AgentType) -> bool {
-    let stripped = strip_resume_flag(command);
-    let trimmed = stripped.trim();
-    let mut tokens = trimmed.split_whitespace();
-    let Some(first) = tokens.next() else {
-        return false;
-    };
-    if tokens.next().is_some() {
-        // More than one token after --resume stripping → custom args
-        // we can't safely round-trip.
-        return false;
-    }
-    let basename = std::path::Path::new(first)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(first);
     let expected: &[&str] = match agent {
         AgentType::CopilotCli => &["copilot"],
         AgentType::ClaudeCode => &["claude"],
         AgentType::OpenCode | AgentType::None => return false,
     };
-    expected.iter().any(|n| basename.eq_ignore_ascii_case(n))
+    let stripped = strip_resume_flag(command);
+    let trimmed = stripped.trim();
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let mut agent_seen = false;
+    for tok in &tokens {
+        if contains_shell_metachar(tok) {
+            return false;
+        }
+        if agent_seen {
+            // Post-agent: only `--flag` style args (no positional
+            // subcommands, no quoted values). Empty token can't happen
+            // after `split_whitespace`, but check defensively.
+            if !tok.starts_with('-') || tok.len() == 1 {
+                return false;
+            }
+            continue;
+        }
+        // Pre-agent: this token must be either the agent binary or a
+        // known wrapper. Path-aware basename match.
+        let basename = std::path::Path::new(tok)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tok);
+        if expected.iter().any(|n| basename.eq_ignore_ascii_case(n)) {
+            agent_seen = true;
+            continue;
+        }
+        if !KNOWN_WRAPPER_NAMES
+            .iter()
+            .any(|w| basename.eq_ignore_ascii_case(w))
+        {
+            return false;
+        }
+    }
+
+    agent_seen
 }
 
 /// Returns the launch command rewritten to resume the given session,
@@ -691,11 +753,17 @@ fn is_simple_agent_invocation(command: &str, agent: &AgentType) -> bool {
 ///   - `session_id` / `agent` are missing (no resume info recorded);
 ///   - the agent doesn't support `--resume` (OpenCode, None);
 ///   - `base` isn't a simple agent invocation (see
-///     `is_simple_agent_invocation` — quoted args, wrappers, etc.);
+///     `is_simple_agent_invocation` — quoted args, unknown wrappers,
+///     positional subcommands, etc.);
 ///   - `session_id` contains characters outside `[A-Za-z0-9_-]`.
 ///     Real Copilot/Claude ids are UUID-shaped, so anything else
 ///     is treated as corrupt and skipped rather than fed into the
 ///     PTY where it would be interpreted by the user's shell.
+///
+/// `--resume <id>` is always appended at the *end* of the stripped
+/// command, after any wrapper / flag tokens — Copilot CLI and Claude
+/// Code both accept flag-style args following positional ones, and
+/// `agency`-style wrappers pass them through transparently.
 ///
 /// Idempotent across workspace round-trips: a stale `--resume <old>`
 /// in `base` is stripped before the new flag is appended.
@@ -915,10 +983,103 @@ impl Drop for ConfigGenStateEnvGuard {
     }
 }
 
-pub(crate) fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/"))
+/// Resolve the user's home directory across platforms.
+///
+/// Fallback chain (first non-empty wins):
+///   1. `USERPROFILE` — the canonical Windows answer; matches what
+///      Windows-native programs (and the `dirs` crate) use. Putting
+///      it first means dot-agent-deck's config lives where Windows
+///      power users expect, and stays consistent with the other
+///      home-directory lookups in this codebase
+///      (`copilot_manage::home_dir`, `ui::open_bookmark` cwd fallback).
+///   2. `HOME` — set on Unix; on Windows it's typically set by
+///      Git Bash / MSYS2 users, and we accept it as a fallback
+///      rather than a primary so behaviour matches a Windows-native
+///      app on a mixed setup.
+///   3. `HOMEDRIVE` + `HOMEPATH` — the Windows-legacy decomposition,
+///      used by some restricted profiles where `USERPROFILE` is
+///      unset.
+///   4. `/` — last-resort sentinel; will route config writes to the
+///      drive root on Windows, which usually fails permission-wise
+///      but at least keeps a single consistent path.
+///
+/// Older builds resolved only `HOME` and fell straight through to
+/// `/`, which on a vanilla Windows profile (no `HOME` set) stranded
+/// the entire dot-agent-deck config tree under `C:\.config\`. New
+/// installs land in `%USERPROFILE%\.config\` instead — see
+/// [`migrate_legacy_config_dir`] for the one-time mover.
+pub fn dirs_home() -> PathBuf {
+    if let Ok(p) = std::env::var("USERPROFILE")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
+    }
+    if let Ok(h) = std::env::var("HOME")
+        && !h.is_empty()
+    {
+        return PathBuf::from(h);
+    }
+    if let (Ok(drive), Ok(path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH"))
+        && !drive.is_empty()
+        && !path.is_empty()
+    {
+        return PathBuf::from(format!("{drive}{path}"));
+    }
+    PathBuf::from("/")
+}
+
+/// One-time migration: if a previous build wrote
+/// `<legacy>/.config/dot-agent-deck/` because `HOME` was unset on
+/// Windows, move it under the current [`dirs_home`] location.
+///
+/// Idempotent: bails out cleanly if (a) legacy and new resolve to the
+/// same path, (b) the legacy tree is absent, or (c) the new tree
+/// already exists (don't clobber freshly-written state).
+///
+/// Output is `eprintln!` rather than `tracing!` because this runs
+/// before the tracing subscriber is installed in `main()`.
+pub fn migrate_legacy_config_dir() {
+    let new = dirs_home().join(".config/dot-agent-deck");
+    let legacy = PathBuf::from("/.config/dot-agent-deck");
+    if let Err(msg) = migrate_legacy_config_dir_impl(&legacy, &new) {
+        eprintln!("dot-agent-deck: config migration warning: {msg}");
+    }
+}
+
+/// Inner migration helper exposed for tests. Returns `Ok(())` when
+/// nothing was needed or the move succeeded; `Err(_)` when the legacy
+/// directory existed but couldn't be moved (the original is left in
+/// place; user can move it manually).
+fn migrate_legacy_config_dir_impl(legacy: &Path, new: &Path) -> Result<(), String> {
+    if legacy == new {
+        return Ok(());
+    }
+    if !legacy.exists() {
+        return Ok(());
+    }
+    if new.exists() {
+        // Don't clobber. User has both — they'll have to merge by hand.
+        return Ok(());
+    }
+    if let Some(parent) = new.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    }
+    std::fs::rename(legacy, new).map_err(|e| {
+        format!(
+            "could not move {} to {}: {e}. Move it manually to keep your bookmarks and workspaces.",
+            legacy.display(),
+            new.display()
+        )
+    })?;
+    eprintln!(
+        "dot-agent-deck: migrated config from {} to {}",
+        legacy.display(),
+        new.display(),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1849,27 +2010,123 @@ timeout_secs = 600
     }
 
     #[test]
-    fn is_simple_invocation_rejects_custom_flags() {
-        assert!(!is_simple_agent_invocation(
-            "copilot --model gpt-5",
+    fn is_simple_invocation_accepts_flag_args_after_agent() {
+        // Boolean flags (and `--flag=value`) after the agent binary
+        // round-trip safely. (Previously rejected; users with
+        // `copilot --allow-all` should still get resume on restore.)
+        assert!(is_simple_agent_invocation(
+            "copilot --allow-all",
             &AgentType::CopilotCli
         ));
-        assert!(!is_simple_agent_invocation(
+        assert!(is_simple_agent_invocation(
+            "copilot --model=gpt-5",
+            &AgentType::CopilotCli
+        ));
+        assert!(is_simple_agent_invocation(
             "claude --print",
             &AgentType::ClaudeCode
         ));
     }
 
     #[test]
-    fn is_simple_invocation_rejects_wrappers() {
+    fn is_simple_invocation_rejects_flag_value_pair_after_agent() {
+        // We can't tell `--model gpt-5` (flag + value) apart from
+        // `--print run` (flag + positional sub-command), so the
+        // strict gate rejects any non-flag token after the agent.
+        // Users with `--flag value` form lose `--resume` on restore
+        // — same as the pre-fix behaviour. They can switch to
+        // `--flag=value` to get resume.
         assert!(!is_simple_agent_invocation(
+            "copilot --model gpt-5",
+            &AgentType::CopilotCli
+        ));
+    }
+
+    #[test]
+    fn is_simple_invocation_rejects_positional_after_agent() {
+        // Plain positional tokens (no preceding flag) are sub-commands
+        // or quoted args that we can't safely round-trip.
+        assert!(!is_simple_agent_invocation(
+            "copilot foo",
+            &AgentType::CopilotCli
+        ));
+        assert!(!is_simple_agent_invocation(
+            "claude help me",
+            &AgentType::ClaudeCode
+        ));
+    }
+
+    #[test]
+    fn is_simple_invocation_accepts_known_wrappers() {
+        // Internal Microsoft wrappers (`agency`/`agenchy`) and
+        // npm-ecosystem runners (`npx`/`pnpx`/`bunx`) precede the
+        // agent token safely and pass flags through to the child.
+        assert!(is_simple_agent_invocation(
+            "agency copilot",
+            &AgentType::CopilotCli
+        ));
+        assert!(is_simple_agent_invocation(
+            "agency copilot --allow-all",
+            &AgentType::CopilotCli
+        ));
+        assert!(is_simple_agent_invocation(
+            "agenchy copilot --allow-all",
+            &AgentType::CopilotCli
+        ));
+        assert!(is_simple_agent_invocation(
             "npx copilot",
             &AgentType::CopilotCli
         ));
+        assert!(is_simple_agent_invocation(
+            "pnpx claude --print",
+            &AgentType::ClaudeCode
+        ));
+        assert!(is_simple_agent_invocation(
+            "bunx copilot",
+            &AgentType::CopilotCli
+        ));
+    }
+
+    #[test]
+    fn is_simple_invocation_rejects_unknown_wrappers() {
+        // `cmd /c copilot` has a flag (`/c`) before the agent that
+        // belongs to the wrapper layer — we can't safely append
+        // `--resume` because the inner shell may re-parse it.
         assert!(!is_simple_agent_invocation(
             "cmd /c copilot",
             &AgentType::CopilotCli
         ));
+        // Random preceding word that isn't in the wrapper whitelist.
+        assert!(!is_simple_agent_invocation(
+            "myshim copilot",
+            &AgentType::CopilotCli
+        ));
+        // Even a known wrapper plus its own flags before the agent
+        // is rejected — we can't tell `-p` from `--p` from `--p val`.
+        assert!(!is_simple_agent_invocation(
+            "npx -p something copilot",
+            &AgentType::CopilotCli
+        ));
+    }
+
+    #[test]
+    fn is_simple_invocation_rejects_shell_metachars() {
+        // Tokens containing shell metacharacters must never be
+        // re-emitted — even past `is_safe_session_id`, the launch
+        // command itself could be a re-injection vector.
+        for cmd in [
+            "copilot --model 'foo'",
+            r#"copilot --model "foo""#,
+            "copilot --model $(whoami)",
+            "copilot --model `whoami`",
+            "copilot --model foo|cat",
+            "copilot && rm -rf /",
+        ] {
+            assert!(
+                !is_simple_agent_invocation(cmd, &AgentType::CopilotCli),
+                "expected reject for: {cmd:?}"
+            );
+        }
     }
 
     #[test]
@@ -1930,9 +2187,79 @@ timeout_secs = 600
     }
 
     #[test]
-    fn build_resume_command_passes_through_complex() {
-        // Custom flags → don't touch.
+    fn build_resume_command_appends_to_flag_args() {
+        // Boolean flags after the agent stay intact; `--resume` is
+        // appended at the end. (Previously this passed through
+        // unchanged — we now resume in this shape too.)
+        assert_eq!(
+            build_resume_command(
+                "copilot --allow-all",
+                Some("abc"),
+                Some(&AgentType::CopilotCli)
+            ),
+            "copilot --allow-all --resume abc"
+        );
+        assert_eq!(
+            build_resume_command(
+                "copilot --model=gpt-5",
+                Some("abc"),
+                Some(&AgentType::CopilotCli)
+            ),
+            "copilot --model=gpt-5 --resume abc"
+        );
+    }
+
+    #[test]
+    fn build_resume_command_passes_through_flag_value_pair() {
+        // `--flag value` form is rejected by the gate (see
+        // `is_simple_invocation_rejects_flag_value_pair_after_agent`)
+        // — command preserved as-is, no resume on restore.
         let cmd = "copilot --model gpt-5";
+        assert_eq!(
+            build_resume_command(cmd, Some("x"), Some(&AgentType::CopilotCli)),
+            cmd
+        );
+    }
+
+    #[test]
+    fn build_resume_command_appends_through_wrapper() {
+        // The headline workspace-resume scenario: `agency` is a hook
+        // wrapper around Copilot CLI and must transparently pass
+        // `--resume <id>` through to the inner agent.
+        assert_eq!(
+            build_resume_command(
+                "agency copilot --allow-all",
+                Some("faa64853-a973-4e84-a4da-84844b63a9cf"),
+                Some(&AgentType::CopilotCli)
+            ),
+            "agency copilot --allow-all --resume faa64853-a973-4e84-a4da-84844b63a9cf"
+        );
+        assert_eq!(
+            build_resume_command("npx claude", Some("def-456"), Some(&AgentType::ClaudeCode)),
+            "npx claude --resume def-456"
+        );
+    }
+
+    #[test]
+    fn build_resume_command_wrapper_round_trip_is_idempotent() {
+        // Restore writes `agency copilot --allow-all --resume X`; on
+        // the next save+restore we must end up with the new id rather
+        // than two flags appended.
+        let first = build_resume_command(
+            "agency copilot --allow-all",
+            Some("session-1"),
+            Some(&AgentType::CopilotCli),
+        );
+        assert_eq!(first, "agency copilot --allow-all --resume session-1");
+        let second = build_resume_command(&first, Some("session-2"), Some(&AgentType::CopilotCli));
+        assert_eq!(second, "agency copilot --allow-all --resume session-2");
+    }
+
+    #[test]
+    fn build_resume_command_passes_through_unknown_wrapper() {
+        // `cmd /c <agent>` has a wrapper-level flag we can't safely
+        // round-trip — leave it alone.
+        let cmd = "cmd /c copilot";
         assert_eq!(
             build_resume_command(cmd, Some("x"), Some(&AgentType::CopilotCli)),
             cmd
@@ -2020,6 +2347,221 @@ timeout_secs = 600
             loaded.panes[0].agent_type.as_ref(),
             Some(&AgentType::CopilotCli)
         );
+    }
+
+    // ----- dirs_home + legacy-dir migration -----
+
+    /// Serializes tests that mutate `HOME` / `USERPROFILE` /
+    /// `HOMEDRIVE` / `HOMEPATH`. Same rationale as
+    /// `WORKSPACES_ENV_LOCK` — these are global mutable state.
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that snapshots the four home-related env vars,
+    /// unsets them all, and restores the originals on drop — so the
+    /// inner test starts from a clean slate and the rest of the
+    /// process keeps its real values when the test finishes.
+    struct HomeEnvGuard {
+        home: Option<String>,
+        profile: Option<String>,
+        drive: Option<String>,
+        path: Option<String>,
+    }
+
+    impl HomeEnvGuard {
+        fn new() -> Self {
+            let g = HomeEnvGuard {
+                home: std::env::var("HOME").ok(),
+                profile: std::env::var("USERPROFILE").ok(),
+                drive: std::env::var("HOMEDRIVE").ok(),
+                path: std::env::var("HOMEPATH").ok(),
+            };
+            // SAFETY: protected by HOME_ENV_LOCK at the call site.
+            unsafe {
+                std::env::remove_var("HOME");
+                std::env::remove_var("USERPROFILE");
+                std::env::remove_var("HOMEDRIVE");
+                std::env::remove_var("HOMEPATH");
+            }
+            g
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: lock-protected.
+            unsafe {
+                match &self.home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.profile {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+                match &self.drive {
+                    Some(v) => std::env::set_var("HOMEDRIVE", v),
+                    None => std::env::remove_var("HOMEDRIVE"),
+                }
+                match &self.path {
+                    Some(v) => std::env::set_var("HOMEPATH", v),
+                    None => std::env::remove_var("HOMEPATH"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dirs_home_prefers_userprofile_first() {
+        // USERPROFILE wins over HOME so dot-agent-deck behaves like a
+        // Windows-native app (and matches `copilot_manage::home_dir`,
+        // `ui::open_bookmark` fallback, and the `dirs` crate).
+        let _lock = HOME_ENV_LOCK.lock().unwrap();
+        let _guard = HomeEnvGuard::new();
+        // SAFETY: lock-protected.
+        unsafe {
+            std::env::set_var("HOME", "/from-home");
+            std::env::set_var("USERPROFILE", "/from-profile");
+        }
+        assert_eq!(dirs_home(), PathBuf::from("/from-profile"));
+    }
+
+    #[test]
+    fn dirs_home_falls_back_to_home_when_userprofile_unset() {
+        // Git Bash / MSYS2 users on Windows often have HOME set but
+        // not USERPROFILE (or vice versa). HOME is the fallback.
+        let _lock = HOME_ENV_LOCK.lock().unwrap();
+        let _guard = HomeEnvGuard::new();
+        // SAFETY: lock-protected.
+        unsafe {
+            std::env::set_var("HOME", "/from-home");
+        }
+        assert_eq!(dirs_home(), PathBuf::from("/from-home"));
+    }
+
+    #[test]
+    fn dirs_home_falls_back_to_userprofile_when_home_unset() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap();
+        let _guard = HomeEnvGuard::new();
+        // SAFETY: lock-protected.
+        unsafe {
+            std::env::set_var("USERPROFILE", r"C:\Users\jonovak");
+        }
+        assert_eq!(dirs_home(), PathBuf::from(r"C:\Users\jonovak"));
+    }
+
+    #[test]
+    fn dirs_home_skips_empty_userprofile() {
+        // Defensive: an empty USERPROFILE (rare, but possible in some
+        // service contexts) must not return PathBuf::from("") — fall
+        // through to the next fallback.
+        let _lock = HOME_ENV_LOCK.lock().unwrap();
+        let _guard = HomeEnvGuard::new();
+        // SAFETY: lock-protected.
+        unsafe {
+            std::env::set_var("USERPROFILE", "");
+            std::env::set_var("HOME", "/from-home");
+        }
+        assert_eq!(dirs_home(), PathBuf::from("/from-home"));
+    }
+
+    #[test]
+    fn dirs_home_falls_back_to_homedrive_homepath() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap();
+        let _guard = HomeEnvGuard::new();
+        // SAFETY: lock-protected.
+        unsafe {
+            std::env::set_var("HOMEDRIVE", "C:");
+            std::env::set_var("HOMEPATH", r"\Users\jonovak");
+        }
+        assert_eq!(dirs_home(), PathBuf::from(r"C:\Users\jonovak"));
+    }
+
+    #[test]
+    fn dirs_home_falls_back_to_slash_when_nothing_set() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap();
+        let _guard = HomeEnvGuard::new();
+        // All four env vars are now unset (HomeEnvGuard).
+        assert_eq!(dirs_home(), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn migrate_legacy_config_dir_noop_when_legacy_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        let new = dir.path().join("new");
+        // Legacy doesn't exist → must be a no-op, and must not create `new`.
+        assert!(migrate_legacy_config_dir_impl(&legacy, &new).is_ok());
+        assert!(!new.exists());
+    }
+
+    #[test]
+    fn migrate_legacy_config_dir_noop_when_paths_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dot-agent-deck");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("config.toml"), "x").unwrap();
+        // Same path on both sides — must not delete or recreate.
+        assert!(migrate_legacy_config_dir_impl(&path, &path).is_ok());
+        assert!(path.join("config.toml").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_config_dir_moves_when_only_legacy_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        let new = dir.path().join("new_parent").join("dot-agent-deck");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("config.toml"), "hi").unwrap();
+        std::fs::write(legacy.join("bookmarked-sessions.json"), "[]").unwrap();
+
+        assert!(migrate_legacy_config_dir_impl(&legacy, &new).is_ok());
+        // Legacy gone, new populated, parent created on the fly.
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read_to_string(new.join("config.toml")).unwrap(),
+            "hi"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.join("bookmarked-sessions.json")).unwrap(),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_config_dir_does_not_clobber_existing_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        let new = dir.path().join("new");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("config.toml"), "old").unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("config.toml"), "current").unwrap();
+
+        assert!(migrate_legacy_config_dir_impl(&legacy, &new).is_ok());
+        // Both dirs preserved; new untouched; user resolves manually.
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("config.toml")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.join("config.toml")).unwrap(),
+            "current"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_config_dir_is_idempotent_on_second_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        let new = dir.path().join("new");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("config.toml"), "x").unwrap();
+
+        assert!(migrate_legacy_config_dir_impl(&legacy, &new).is_ok());
+        assert!(new.exists() && !legacy.exists());
+        // Second call: legacy is gone → no-op, no panic.
+        assert!(migrate_legacy_config_dir_impl(&legacy, &new).is_ok());
+        assert!(new.exists());
     }
 
     #[test]
