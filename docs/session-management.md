@@ -13,7 +13,7 @@ Each session card shows the agent's current state:
 |---|---|
 | **Thinking** | Agent is reasoning before acting |
 | **Working** | Agent is executing a tool (tool name shown) |
-| **Pending** | Agent appears stalled at an interactive prompt (e.g., a "pick one" multiple-choice question printed to its pane) — needs your attention, but not as a permission request. Inferred when a session has been Working for `pending.timeout_seconds` (default 10s) with no active tool and no new events. Configurable via `dot-agent-deck config set pending.timeout_seconds <N>`; set to `0` to disable. Bell fires by default on the transition — disable with `dot-agent-deck config set bell.on_pending false`. |
+| **Pending** | Agent appears stalled at an interactive prompt (e.g., a "pick one" multiple-choice question printed to its pane) — needs your attention, but not as a permission request. Inferred when a session has been Working for `pending.timeout_seconds` (default 30s) with no active tool and no new events, confirmed over two consecutive checks to suppress one-shot LLM-gap flicker. Configurable via `dot-agent-deck config set pending.timeout_seconds <N>`; set to `0` to disable. Bell fires by default on the transition — disable with `dot-agent-deck config set bell.on_pending false`. |
 | **Compacting** | Context window is being compressed |
 | **WaitingForInput** | Agent needs user approval or input (explicit permission prompt) |
 | **Idle** | Agent is between tasks |

@@ -33,7 +33,7 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     (
         "pending.timeout_seconds",
-        "Seconds in Working before card flips to Pending (default: 10, set to 0 to disable)",
+        "Seconds in Working before card flips to Pending (default: 30, set to 0 to disable)",
     ),
     (
         "idle_art.enabled",
@@ -156,7 +156,18 @@ pub struct PendingConfig {
 impl Default for PendingConfig {
     fn default() -> Self {
         Self {
-            timeout_seconds: 10,
+            // 30 s is a deliberate trade-off. The heuristic exists to catch
+            // genuine stalls at interactive prompts, but the actual signal
+            // (no hook events while in Working/Thinking with no active tool)
+            // is also produced by long pure-LLM-thinking gaps — common with
+            // reasoning models and slow Copilot CLI responses. A 10 s
+            // default false-positived during normal mid-conversation gaps,
+            // causing visible Pending → Working flicker. 30 s comfortably
+            // exceeds typical LLM silence between tool calls while still
+            // catching true stalls within half a minute. Users can tune
+            // back down with `pending.timeout_seconds` or disable the
+            // heuristic with `0`.
+            timeout_seconds: 30,
         }
     }
 }
@@ -1107,15 +1118,15 @@ on_idle = true
     }
 
     #[test]
-    fn pending_timeout_seconds_default_is_10() {
+    fn pending_timeout_seconds_default_is_30() {
         let cfg = PendingConfig::default();
-        assert_eq!(cfg.timeout_seconds, 10);
+        assert_eq!(cfg.timeout_seconds, 30);
     }
 
     #[test]
     fn pending_timeout_get_set_field() {
         let mut dc = DashboardConfig::default();
-        assert_eq!(dc.get_field("pending.timeout_seconds").unwrap(), "10");
+        assert_eq!(dc.get_field("pending.timeout_seconds").unwrap(), "30");
         dc.set_field("pending.timeout_seconds", "25").unwrap();
         assert_eq!(dc.pending.timeout_seconds, 25);
         // Zero disables the feature.
@@ -1782,6 +1793,7 @@ timeout_secs = 600
             first_prompts: vec![],
             pane_id: Some(pane_id.to_string()),
             active_subagent_count: 0,
+            pending_strikes: 0,
         }
     }
 

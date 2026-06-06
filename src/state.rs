@@ -69,6 +69,14 @@ pub struct SessionState {
     /// `Idle` prematurely. Saturating: never goes negative if events
     /// arrive in an unexpected order.
     pub active_subagent_count: u32,
+    /// Consecutive `apply_pending_timeout` checks where the session was
+    /// found stale (eligible AND `elapsed >= timeout`) without a Pending
+    /// flip having happened yet. Reset to 0 on any new event arriving
+    /// via `apply_event`, and reset to 0 immediately after a Pending
+    /// flip. The flip is gated on `strikes >= PENDING_CONFIRMATION_STRIKES`
+    /// so a one-shot LLM-thinking gap right at the timeout boundary
+    /// can't produce a visible Working → Pending → Working flicker.
+    pub pending_strikes: u32,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -141,6 +149,7 @@ impl AppState {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 active_subagent_count: 0,
+                pending_strikes: 0,
                 pane_id: Some(pane_id),
             },
         );
@@ -322,10 +331,16 @@ impl AppState {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 active_subagent_count: 0,
+                pending_strikes: 0,
                 pane_id: event.pane_id.clone(),
             });
 
         session.last_activity = event.timestamp;
+        // Any event arriving for the session counts as activity — reset the
+        // Pending-confirmation counter. Without this, a `apply_pending_timeout`
+        // tick that previously banked a strike would still credit it the next
+        // time the session went quiet, defeating the multi-tick gate.
+        session.pending_strikes = 0;
 
         if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
             session.agent_type = event.agent_type.clone();
@@ -486,11 +501,20 @@ impl AppState {
     /// **By-design caveat.** The heuristic intentionally cannot distinguish
     /// "agent is stuck at a non-hook prompt" from "agent is taking longer
     /// than `timeout` to think/decide". Both look like
-    /// `status=Working|Thinking AND active_tool=None`. The default 10 s
+    /// `status=Working|Thinking AND active_tool=None`. The default 30 s
     /// timeout is generous enough for typical LLM gaps; if a user runs
     /// into the false-positive case (very long Thinking on complex
     /// prompts) they can tune `pending.timeout_seconds` up or set it to
     /// 0 to disable the heuristic entirely.
+    ///
+    /// **Confirmation gate.** Even with a generous timeout, a single
+    /// LLM gap right at the timeout boundary used to produce a visible
+    /// Working → Pending → Working flicker. To eliminate that, a session
+    /// must be observed stale on `PENDING_CONFIRMATION_STRIKES`
+    /// consecutive calls (≈one call per second from `ui.rs`) before the
+    /// flip actually fires. Any new event resets the strike counter via
+    /// `apply_event`, so true silence is the only thing that accumulates
+    /// strikes.
     pub fn apply_pending_timeout(&mut self, timeout: chrono::Duration) -> Vec<String> {
         let now = Utc::now();
         let mut transitioned = Vec::new();
@@ -505,7 +529,9 @@ impl AppState {
                 // Other statuses are by design ineligible (Idle, Pending
                 // itself, WaitingForInput, Compacting, Error). Skipping
                 // silently — those are the common case, no diagnostic
-                // value in logging them.
+                // value in logging them. Also reset strikes so a session
+                // that re-enters Working/Thinking later starts fresh.
+                session.pending_strikes = 0;
                 continue;
             }
             // Compute elapsed early so we can include it in skip logs.
@@ -534,6 +560,7 @@ impl AppState {
                         active_tool = %tool.name,
                         "pending_check skipped: active_tool"
                     );
+                    session.pending_strikes = 0;
                     continue;
                 }
             }
@@ -548,6 +575,7 @@ impl AppState {
                     subagent_count = session.active_subagent_count,
                     "pending_check skipped: active subagents"
                 );
+                session.pending_strikes = 0;
                 continue;
             }
             // Reject negative (clock went backward) and absurdly large
@@ -559,20 +587,39 @@ impl AppState {
                     elapsed_ms,
                     "pending_check skipped: clock skew rejected"
                 );
+                session.pending_strikes = 0;
                 continue;
             }
             if elapsed >= timeout {
-                info!(
-                    session_id = %sid,
-                    from_status = ?session.status,
-                    elapsed_ms,
-                    timeout_ms = timeout.num_milliseconds(),
-                    active_tool = %session.active_tool.as_ref().map(|t| t.name.as_str()).unwrap_or(""),
-                    "pending_check fired: transitioning to Pending"
-                );
-                session.status = SessionStatus::Pending;
-                transitioned.push(sid.clone());
+                session.pending_strikes = session.pending_strikes.saturating_add(1);
+                if session.pending_strikes >= PENDING_CONFIRMATION_STRIKES {
+                    info!(
+                        session_id = %sid,
+                        from_status = ?session.status,
+                        elapsed_ms,
+                        timeout_ms = timeout.num_milliseconds(),
+                        strikes = session.pending_strikes,
+                        active_tool = %session.active_tool.as_ref().map(|t| t.name.as_str()).unwrap_or(""),
+                        "pending_check fired: transitioning to Pending"
+                    );
+                    session.status = SessionStatus::Pending;
+                    session.pending_strikes = 0;
+                    transitioned.push(sid.clone());
+                } else {
+                    info!(
+                        session_id = %sid,
+                        status = ?session.status,
+                        elapsed_ms,
+                        timeout_ms = timeout.num_milliseconds(),
+                        strikes = session.pending_strikes,
+                        required = PENDING_CONFIRMATION_STRIKES,
+                        "pending_check banked strike: waiting for confirmation"
+                    );
+                }
             } else {
+                // Below the timeout — a fresh-enough event has arrived.
+                // Drop any banked strike so the next stall starts from zero.
+                session.pending_strikes = 0;
                 info!(
                     session_id = %sid,
                     status = ?session.status,
@@ -586,6 +633,18 @@ impl AppState {
         transitioned
     }
 }
+
+/// Number of consecutive `apply_pending_timeout` checks during which a
+/// session must be observed stale (eligible AND `elapsed >= timeout`)
+/// before the Working → Pending flip actually fires. Because the caller
+/// in `ui.rs` invokes this roughly once per second, the value is also
+/// the additional seconds of grace beyond `pending.timeout_seconds`.
+///
+/// Set to `2` to eliminate the single-tick LLM-thinking-gap flicker
+/// (Working → Pending → Working on the same render cycle) without
+/// noticeably delaying a real stall — a stuck agent still flips within
+/// `timeout + ~1 s`.
+const PENDING_CONFIRMATION_STRIKES: u32 = 2;
 
 /// Maximum trusted elapsed-time-since-last-activity that
 /// `apply_pending_timeout` will act on. Values above this are taken as
@@ -1481,8 +1540,14 @@ mod tests {
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
 
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert_eq!(transitioned, vec!["s1".to_string()]);
+        // First check banks a strike but does NOT flip — the confirmation
+        // gate suppresses single-tick LLM-gap flicker. Second check (no
+        // intervening event to reset strikes) crosses the threshold.
+        let first = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(first.is_empty());
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        let second = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert_eq!(second, vec!["s1".to_string()]);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
     }
 
@@ -1554,6 +1619,12 @@ mod tests {
 
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
+        // Two consecutive checks needed (confirmation gate).
+        assert!(
+            state
+                .apply_pending_timeout(chrono::Duration::seconds(10))
+                .is_empty()
+        );
         let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert_eq!(transitioned, vec!["s1".to_string()]);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
@@ -1579,6 +1650,12 @@ mod tests {
 
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
+        // Two consecutive checks needed (confirmation gate).
+        assert!(
+            state
+                .apply_pending_timeout(chrono::Duration::seconds(10))
+                .is_empty()
+        );
         let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert_eq!(transitioned, vec!["s1".to_string()]);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
@@ -1635,6 +1712,8 @@ mod tests {
         state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
+        // Two consecutive checks needed (confirmation gate).
+        state.apply_pending_timeout(chrono::Duration::seconds(10));
         state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
 
@@ -1656,11 +1735,76 @@ mod tests {
         state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
+        // Two consecutive checks needed (confirmation gate).
+        state.apply_pending_timeout(chrono::Duration::seconds(10));
         state.apply_pending_timeout(chrono::Duration::seconds(10));
 
         let stats = state.aggregate_stats();
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.working, 0);
+    }
+
+    #[test]
+    fn pending_confirmation_gate_suppresses_single_tick_flicker() {
+        // Regression guard for the user-visible "card briefly flips to
+        // Pending then back to Working" flicker. The scenario:
+        //   1. Working session has a >timeout LLM gap (no events arrive).
+        //   2. apply_pending_timeout fires — session is eligible AND stale.
+        //   3. The agent then emits a fresh event before the *next* check.
+        //
+        // Before this fix the first check flipped status to Pending,
+        // producing a one-render flash. With the strike gate, the first
+        // check only banks a strike (status stays Working), the fresh
+        // event resets the strike, and the user never sees Pending.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+
+        // First check: stale, but only one strike — no flip yet.
+        let first = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(
+            first.is_empty(),
+            "single-tick staleness must NOT flip to Pending"
+        );
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+        assert_eq!(state.sessions["s1"].pending_strikes, 1);
+
+        // Agent emits a fresh tool — this is the case the gate protects
+        // against. The banked strike must be cleared.
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("Read".into());
+        state.apply_event(tool);
+        assert_eq!(state.sessions["s1"].pending_strikes, 0);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn pending_strikes_reset_when_status_leaves_eligible() {
+        // If the session transitions out of Working/Thinking between
+        // strike-banking checks (e.g., a permission prompt arrives), the
+        // accumulated strikes must be cleared so the next stale Working
+        // period starts the gate from zero.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+
+        // Bank one strike while Working.
+        state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert_eq!(state.sessions["s1"].pending_strikes, 1);
+
+        // Session pivots out of eligible status (e.g., permission prompt).
+        state.sessions.get_mut("s1").unwrap().status = SessionStatus::WaitingForInput;
+        // Next check: ineligible — strikes must be reset, not retained.
+        state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert_eq!(state.sessions["s1"].pending_strikes, 0);
     }
 
     #[test]
@@ -1720,6 +1864,12 @@ mod tests {
         state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::hours(23);
+        // Two consecutive checks needed (confirmation gate).
+        assert!(
+            state
+                .apply_pending_timeout(chrono::Duration::hours(22))
+                .is_empty()
+        );
         let transitioned = state.apply_pending_timeout(chrono::Duration::hours(22));
         assert_eq!(transitioned, vec!["s1".to_string()]);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);

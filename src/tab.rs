@@ -790,6 +790,7 @@ mod tests {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 active_subagent_count: 0,
+                pending_strikes: 0,
                 pane_id: None,
             },
         )
@@ -852,6 +853,7 @@ mod tests {
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 active_subagent_count: 0,
+                pending_strikes: 0,
                 pane_id: None,
             },
         );
