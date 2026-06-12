@@ -2210,6 +2210,31 @@ fn base64_encode(input: &[u8]) -> String {
     result
 }
 
+/// Extract text for `sel` from `screen`, push it to the system clipboard
+/// via OSC 52, and post a "Copied to clipboard" status toast when at
+/// least one character was extracted.
+///
+/// Returns `true` if a copy was performed. The caller is responsible
+/// for clearing `ui.selection` after invoking this (clearing happens
+/// even on a failed extract — see callers).
+///
+/// Shared by the right-click and Ctrl+C copy paths to keep the two
+/// in lockstep (frame-glyph stripping, status text, OSC 52 wrapping).
+fn copy_selection_from_screen(
+    screen: &vt100::Screen,
+    sel: &TextSelection,
+    status_message: &mut Option<(String, std::time::Instant)>,
+) -> bool {
+    let offset = screen_row_offset(screen, sel.pane_rect);
+    let text = extract_selection_text(screen, sel, offset);
+    if text.is_empty() {
+        return false;
+    }
+    copy_to_clipboard_osc52(&text);
+    *status_message = Some(("Copied to clipboard".to_string(), std::time::Instant::now()));
+    true
+}
+
 /// Find the word boundaries around (row, col) in a vt100 screen.
 /// `row` is widget-relative; `row_offset` maps it to screen coordinates.
 /// Returns (start_col, end_col) for the word at the given position.
@@ -4138,15 +4163,11 @@ pub fn run_tui(
                                 if let Some(screen_arc) = embedded.get_screen(&pane_id)
                                     && let Ok(parser) = screen_arc.lock()
                                 {
-                                    let offset = screen_row_offset(parser.screen(), sel.pane_rect);
-                                    let text = extract_selection_text(parser.screen(), sel, offset);
-                                    if !text.is_empty() {
-                                        copy_to_clipboard_osc52(&text);
-                                        ui.status_message = Some((
-                                            "Copied to clipboard".to_string(),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
+                                    copy_selection_from_screen(
+                                        parser.screen(),
+                                        sel,
+                                        &mut ui.status_message,
+                                    );
                                 }
                                 ui.selection = None;
                             } else if ui.mode == UiMode::PaneInput {
@@ -4340,15 +4361,7 @@ pub fn run_tui(
                     if let Some(screen_arc) = embedded.get_screen(&pane_id)
                         && let Ok(parser) = screen_arc.lock()
                     {
-                        let offset = screen_row_offset(parser.screen(), sel.pane_rect);
-                        let text = extract_selection_text(parser.screen(), sel, offset);
-                        if !text.is_empty() {
-                            copy_to_clipboard_osc52(&text);
-                            ui.status_message = Some((
-                                "Copied to clipboard".to_string(),
-                                std::time::Instant::now(),
-                            ));
-                        }
+                        copy_selection_from_screen(parser.screen(), sel, &mut ui.status_message);
                     }
                     ui.selection = None;
                     shortcut_handled = true;
