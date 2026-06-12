@@ -4325,6 +4325,36 @@ pub fn run_tui(
             // Global Ctrl+key shortcuts (work from any mode / future pane focus)
             // ---------------------------------------------------------------
             if !shortcut_handled && key.modifiers.contains(KeyModifiers::CONTROL) {
+                // Ctrl+C with a visible drag-selection in PaneInput: copy the
+                // selection (same path as right-click) instead of forwarding
+                // Ctrl+C to the agent. Matches Windows-explorer / GUI convention
+                // where Ctrl+C means "copy when something is selected" and
+                // preserves Ctrl+C → SIGINT for the agent when nothing is
+                // selected.
+                if key.code == KeyCode::Char('c')
+                    && ui.mode == UiMode::PaneInput
+                    && let Some(ref sel) = ui.selection
+                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                    && let Some(pane_id) = embedded.focused_pane_id()
+                {
+                    if let Some(screen_arc) = embedded.get_screen(&pane_id)
+                        && let Ok(parser) = screen_arc.lock()
+                    {
+                        let offset = screen_row_offset(parser.screen(), sel.pane_rect);
+                        let text = extract_selection_text(parser.screen(), sel, offset);
+                        if !text.is_empty() {
+                            copy_to_clipboard_osc52(&text);
+                            ui.status_message = Some((
+                                "Copied to clipboard".to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                    ui.selection = None;
+                    shortcut_handled = true;
+                }
+            }
+            if !shortcut_handled && key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
                     // Ctrl+d: enter Normal (command) mode, stay on current tab
                     KeyCode::Char('d') => {
