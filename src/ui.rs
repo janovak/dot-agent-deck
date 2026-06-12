@@ -1721,6 +1721,63 @@ fn extract_url_at_column(row_text: &str, col: u16) -> Option<String> {
     }
 }
 
+/// Returns `true` if `c` is a Unicode box-drawing or block-element glyph.
+/// These are the characters agent CLIs (notably Copilot CLI) use to draw
+/// their own input/output frames inside the PTY (`┃`, `│`, `║`, etc.).
+fn is_pty_frame_glyph(c: char) -> bool {
+    // Box Drawing: U+2500..=U+257F. Block Elements: U+2580..=U+259F.
+    matches!(c, '\u{2500}'..='\u{259F}')
+}
+
+/// Returns `true` if `c` is a **heavy** vertical box-drawing glyph that
+/// is almost always an agent's outer-frame decoration when it appears
+/// at the start of a line. Light `│` is deliberately excluded because
+/// it is also the leftmost column of `tree`-style output that the user
+/// almost certainly wants to keep.
+fn is_pty_heavy_vertical_frame(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2503}'  // ┃ HEAVY VERTICAL
+        | '\u{2507}'  // ┇ HEAVY TRIPLE DASH VERTICAL
+        | '\u{250B}'  // ┋ HEAVY QUADRUPLE DASH VERTICAL
+        | '\u{2551}'  // ║ DOUBLE VERTICAL
+        | '\u{254F}' // ╏ HEAVY DOUBLE DASH VERTICAL
+    )
+}
+
+/// Strip per-line agent frame decoration from a single extracted line.
+///
+/// Agents like Copilot CLI draw their own input/output frames inside the
+/// PTY using box-drawing characters. When the user drag-selects multi-
+/// line content out of an agent pane, those frame glyphs would otherwise
+/// end up in the clipboard as a column of `┃` on the right of every
+/// line (and sometimes on the left too).
+///
+/// * Trailing: strip any run of box-drawing / block-element glyphs and
+///   adjacent whitespace. Anything that trails real content with frame
+///   glyphs is decoration.
+/// * Leading: strip at most one **heavy** vertical frame glyph (e.g. `┃`,
+///   `║`) and one adjacent space/tab. Light `│` is deliberately preserved
+///   because it is also the leftmost column of `tree`-style output, and
+///   any other middle box-drawing glyph (`├`, `└`, `─`) is content, not
+///   frame.
+fn strip_pty_frame_glyphs(line: &str) -> String {
+    let trimmed_end =
+        line.trim_end_matches(|c: char| is_pty_frame_glyph(c) || c == ' ' || c == '\t');
+    let mut chars = trimmed_end.chars();
+    match chars.next() {
+        Some(c) if is_pty_heavy_vertical_frame(c) => {
+            let rest = chars.as_str();
+            if let Some(after) = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('\t')) {
+                after.to_string()
+            } else {
+                rest.to_string()
+            }
+        }
+        _ => trimmed_end.to_string(),
+    }
+}
+
 /// Extract text from a vt100 screen for the given selection region.
 /// Selection coordinates are widget-relative; `row_offset` maps them to screen rows.
 fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offset: u16) -> String {
@@ -1729,7 +1786,7 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offse
     } else {
         (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
     };
-    let mut result = String::new();
+    let mut lines: Vec<String> = Vec::new();
     let (screen_rows, screen_cols) = screen.size();
     for widget_row in sr..=er {
         let screen_row = widget_row + row_offset;
@@ -1742,26 +1799,20 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offse
         } else {
             screen_cols.saturating_sub(1)
         };
+        let mut line = String::new();
         for col in col_start..=col_end.min(screen_cols.saturating_sub(1)) {
             if let Some(cell) = screen.cell(screen_row, col) {
                 let ch = cell.contents();
                 if ch.is_empty() {
-                    result.push(' ');
+                    line.push(' ');
                 } else {
-                    result.push_str(ch);
+                    line.push_str(ch);
                 }
             }
         }
-        // Trim trailing spaces per line and add newline between lines.
-        if widget_row < er {
-            let trimmed = result.trim_end_matches(' ');
-            let trimmed_len = trimmed.len();
-            result.truncate(trimmed_len);
-            result.push('\n');
-        }
+        lines.push(strip_pty_frame_glyphs(&line));
     }
-    let trimmed = result.trim_end_matches(' ');
-    trimmed.to_string()
+    lines.join("\n")
 }
 
 /// Whether dot-agent-deck should always wrap pastes for this agent in
@@ -7311,6 +7362,76 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    #[test]
+    fn strip_pty_frame_glyphs_removes_trailing_box_drawing() {
+        assert_eq!(strip_pty_frame_glyphs("code┃"), "code");
+        assert_eq!(strip_pty_frame_glyphs("code  ┃  "), "code");
+        assert_eq!(strip_pty_frame_glyphs("code ┃ ┃"), "code");
+        assert_eq!(strip_pty_frame_glyphs("code│"), "code");
+    }
+
+    #[test]
+    fn strip_pty_frame_glyphs_preserves_code_indentation() {
+        // Heavy code indentation must survive — no leading frame glyph here.
+        let line = "                          public Foo(                          ┃";
+        assert_eq!(
+            strip_pty_frame_glyphs(line),
+            "                          public Foo("
+        );
+    }
+
+    #[test]
+    fn strip_pty_frame_glyphs_strips_left_frame_and_one_pad_space() {
+        // Heavy left frame stripped (with 1 pad space).
+        assert_eq!(strip_pty_frame_glyphs("┃ code ┃"), "code");
+        // Only ONE leading space stripped after frame — preserves further indent.
+        assert_eq!(strip_pty_frame_glyphs("┃   code   ┃"), "  code");
+        // Heavy left frame with no padding → frame stripped, content kept.
+        assert_eq!(strip_pty_frame_glyphs("┃code┃"), "code");
+        // Light `│` left frame is NOT stripped (too ambiguous with tree).
+        assert_eq!(strip_pty_frame_glyphs("│ code │"), "│ code");
+    }
+
+    #[test]
+    fn strip_pty_frame_glyphs_preserves_middle_box_drawing() {
+        // Tree branches `├──` survive — leading `├` is not a vertical frame glyph.
+        assert_eq!(strip_pty_frame_glyphs("├── src   ┃"), "├── src");
+        assert_eq!(strip_pty_frame_glyphs("├── src"), "├── src");
+        // Continued tree column `│  ` survives (light `│` excluded from leading strip).
+        assert_eq!(
+            strip_pty_frame_glyphs("│  └── nested.rs"),
+            "│  └── nested.rs"
+        );
+    }
+
+    #[test]
+    fn strip_pty_frame_glyphs_handles_all_frame_or_empty_line() {
+        assert_eq!(strip_pty_frame_glyphs("┃"), "");
+        assert_eq!(strip_pty_frame_glyphs("  ┃  "), "");
+        assert_eq!(strip_pty_frame_glyphs(""), "");
+        assert_eq!(strip_pty_frame_glyphs("   "), "");
+    }
+
+    #[test]
+    fn extract_selection_text_strips_agent_frame_on_copy() {
+        // Simulate an agent rendering 3 lines with `┃` at right edge of a 20-col PTY.
+        let mut parser = vt100::Parser::new(5, 20, 0);
+        parser.process(b"line one          \xE2\x94\x83\r\n");
+        parser.process(b"line two          \xE2\x94\x83\r\n");
+        parser.process(b"line three        \xE2\x94\x83\r\n");
+        let screen = parser.screen();
+
+        let sel = TextSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: 2,
+            end_col: 19,
+            pane_rect: ratatui::layout::Rect::new(0, 0, 20, 5),
+        };
+        let text = extract_selection_text(screen, &sel, 0);
+        assert_eq!(text, "line one\nline two\nline three");
     }
 
     #[test]
