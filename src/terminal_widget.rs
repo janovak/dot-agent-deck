@@ -3,39 +3,10 @@ use std::sync::{Arc, Mutex};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::theme::ColorPalette;
-
-/// Border symbol set for cards and embedded terminal panes.
-///
-/// Visually identical to a card with no right border — the box-drawing
-/// glyphs on the right edge (vertical bar and the two right-side
-/// corners) are replaced with spaces. The right column is still
-/// reserved by ratatui's `Borders::ALL` layout, so all the
-/// `inner_w = width - 2` math throughout the codebase keeps working
-/// (no risk of breaking PTY sizing, hit-tests, or layout). The only
-/// observable change is that selecting card content with the
-/// terminal's native mouse selection no longer drags in the `│` /
-/// `┃` glyph at the right margin — empty cells copy as a trailing
-/// space, which pastes cleanly into editors and gets stripped by any
-/// reasonable trimmer.
-///
-/// The left border is intentionally still drawn (left edge of a card
-/// is rarely included in a content-region drag-select), and titles
-/// continue to be rendered on the top border row.
-pub(crate) const COPY_FRIENDLY_BORDER: border::Set = border::Set {
-    top_left: border::PLAIN.top_left,
-    top_right: " ",
-    bottom_left: border::PLAIN.bottom_left,
-    bottom_right: " ",
-    vertical_left: border::PLAIN.vertical_left,
-    vertical_right: " ",
-    horizontal_top: border::PLAIN.horizontal_top,
-    horizontal_bottom: border::PLAIN.horizontal_bottom,
-};
 
 /// Converts a vt100 color to a ratatui Color.
 fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
@@ -107,7 +78,6 @@ impl Widget for TerminalWidget {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_set(COPY_FRIENDLY_BORDER)
             .border_style(border_style)
             .title(self.title)
             .style(Style::default().bg(self.palette.terminal_bg));
@@ -329,46 +299,6 @@ mod tests {
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
-    }
-
-    #[test]
-    fn terminal_widget_right_border_column_is_space_not_glyph() {
-        // Regression: terminal selection used to grab the right `│` /
-        // `┃` glyph at the card's right margin, polluting any copied
-        // code block. The copy-friendly border set replaces the right
-        // border glyphs with spaces; verify every cell in the right
-        // column is a literal " ".
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(8, 38, 0)));
-        let widget = TerminalWidget::new(parser, "test".to_string(), true, ColorPalette::dark());
-        let area = Rect::new(0, 0, 40, 10);
-        let mut buf = Buffer::empty(area);
-        widget.render(area, &mut buf);
-
-        let right_col = area.width - 1;
-        for y in 0..area.height {
-            let cell = buf
-                .cell((right_col, y))
-                .expect("right-column cell must exist");
-            assert_eq!(
-                cell.symbol(),
-                " ",
-                "right-column cell at ({right_col},{y}) should be a space, got {:?}",
-                cell.symbol()
-            );
-        }
-
-        // Sanity: the LEFT border column still draws the vertical
-        // glyph so cards retain a visible left edge.
-        let left_inner_rows = 1..(area.height - 1);
-        for y in left_inner_rows {
-            let cell = buf.cell((0, y)).expect("left-column cell must exist");
-            assert_eq!(
-                cell.symbol(),
-                "│",
-                "left-column cell at (0,{y}) should be │, got {:?}",
-                cell.symbol()
-            );
-        }
     }
 
     #[test]
