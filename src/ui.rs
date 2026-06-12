@@ -6897,6 +6897,7 @@ fn render_session_card(
 
     let mut block = Block::default()
         .borders(Borders::ALL)
+        .border_set(crate::terminal_widget::COPY_FRIENDLY_BORDER)
         .border_style(border_style)
         .title(Span::styled(
             title_left,
