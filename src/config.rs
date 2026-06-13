@@ -1948,6 +1948,7 @@ timeout_secs = 600
             active_tool: None,
             started_at: chrono::Utc::now(),
             last_activity: chrono::Utc::now() - chrono::Duration::seconds(seconds_ago),
+            last_pty_activity: chrono::Utc::now() - chrono::Duration::seconds(seconds_ago),
             recent_events: Default::default(),
             tool_count: 0,
             last_user_prompt: None,

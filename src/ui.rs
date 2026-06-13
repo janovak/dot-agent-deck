@@ -3393,7 +3393,26 @@ pub fn run_tui(
         let pending_timeout_secs = ui.config.pending.timeout_seconds;
         if pending_timeout_secs > 0 && tick.is_multiple_of(60) {
             let timeout = chrono::Duration::seconds(pending_timeout_secs as i64);
-            let _ = state.blocking_write().apply_pending_timeout(timeout);
+            // Bridge raw PTY-byte timestamps from the embedded controller into
+            // state before the heuristic runs. Streaming-tokens sessions emit
+            // bytes constantly even when hook events are sparse; without this
+            // bridge they false-positive into Pending during long LLM gaps.
+            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                let mut st = state.blocking_write();
+                let pane_ids: std::collections::HashSet<String> = st
+                    .sessions
+                    .values()
+                    .filter_map(|s| s.pane_id.clone())
+                    .collect();
+                for pid in pane_ids {
+                    if let Some(dt) = embedded.last_pty_byte_at(&pid) {
+                        st.bump_pty_activity(&pid, dt);
+                    }
+                }
+                let _ = st.apply_pending_timeout(timeout);
+            } else {
+                let _ = state.blocking_write().apply_pending_timeout(timeout);
+            }
         }
 
         let snapshot = state.blocking_read().clone();
@@ -7646,6 +7665,7 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
+            last_pty_activity: Utc::now(),
             recent_events: events,
             tool_count: 0,
             last_user_prompt: None,
@@ -8659,6 +8679,7 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
+            last_pty_activity: Utc::now(),
             recent_events: std::collections::VecDeque::new(),
             tool_count: 0,
             last_user_prompt: None,
@@ -9078,6 +9099,7 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
+            last_pty_activity: Utc::now(),
             recent_events: events,
             tool_count: 0,
             last_user_prompt: Some("third prompt".to_string()),
@@ -9112,6 +9134,7 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
+            last_pty_activity: Utc::now(),
             recent_events: VecDeque::new(),
             tool_count: 0,
             last_user_prompt: Some("old prompt".to_string()),
@@ -9137,6 +9160,7 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
+            last_pty_activity: Utc::now(),
             recent_events: VecDeque::new(),
             tool_count: 0,
             last_user_prompt: None,
@@ -10584,6 +10608,7 @@ mod tests {
                     active_tool: None,
                     started_at: Utc::now(),
                     last_activity: Utc::now(),
+                    last_pty_activity: Utc::now(),
                     recent_events: std::collections::VecDeque::new(),
                     tool_count: 0,
                     last_user_prompt: None,
@@ -10658,6 +10683,7 @@ mod tests {
                     active_tool: None,
                     started_at: Utc::now(),
                     last_activity: Utc::now(),
+                    last_pty_activity: Utc::now(),
                     recent_events: std::collections::VecDeque::new(),
                     tool_count: 0,
                     last_user_prompt: None,

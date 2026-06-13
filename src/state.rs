@@ -57,6 +57,18 @@ pub struct SessionState {
     pub active_tool: Option<ActiveTool>,
     pub started_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
+    /// Most recent time the embedded PTY for this session emitted any
+    /// bytes from the agent. Updated out-of-band by the UI loop from
+    /// `EmbeddedPaneController::last_pty_byte_at` before each Pending
+    /// check; never bumped by `apply_event`. Display surfaces
+    /// ("Last: 5s ago", idle-art timer, workspace-restore preference)
+    /// deliberately keep using `last_activity` so they reflect
+    /// meaningful agent activity rather than every spinner tick.
+    ///
+    /// Initialised to `last_activity` so a session with no recorded
+    /// PTY traffic yet does not look artificially older than its hook
+    /// events.
+    pub last_pty_activity: DateTime<Utc>,
     pub recent_events: VecDeque<AgentEvent>,
     pub tool_count: u32,
     pub last_user_prompt: Option<String>,
@@ -144,6 +156,7 @@ impl AppState {
                 active_tool: None,
                 started_at,
                 last_activity: now,
+                last_pty_activity: now,
                 recent_events: VecDeque::new(),
                 tool_count: 0,
                 last_user_prompt: None,
@@ -161,6 +174,20 @@ impl AppState {
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
+    }
+
+    /// Record that the embedded PTY for `pane_id` emitted bytes from
+    /// the agent at `at`. Updates `last_pty_activity` on every session
+    /// bound to that pane (typically one) when `at` is more recent than
+    /// the stored value. Used by the UI loop to bridge the PTY reader
+    /// thread into the Pending-flip heuristic without changing the
+    /// hook-event-driven `last_activity` semantics that drive display.
+    pub fn bump_pty_activity(&mut self, pane_id: &str, at: DateTime<Utc>) {
+        for session in self.sessions.values_mut() {
+            if session.pane_id.as_deref() == Some(pane_id) && at > session.last_pty_activity {
+                session.last_pty_activity = at;
+            }
+        }
     }
 
     /// Handle a delegate signal from the orchestrator.
@@ -326,6 +353,7 @@ impl AppState {
                 active_tool: None,
                 started_at: pane_started.unwrap_or(event.timestamp),
                 last_activity: event.timestamp,
+                last_pty_activity: event.timestamp,
                 recent_events: VecDeque::new(),
                 tool_count: 0,
                 last_user_prompt: None,
@@ -535,7 +563,12 @@ impl AppState {
                 continue;
             }
             // Compute elapsed early so we can include it in skip logs.
-            let elapsed = now.signed_duration_since(session.last_activity);
+            // Use the more recent of the hook-event-driven `last_activity`
+            // and the PTY-byte-driven `last_pty_activity` so a session
+            // that is streaming response tokens (no hook events firing,
+            // but bytes flowing) does not flip to Pending mid-stream.
+            let effective_last = session.last_activity.max(session.last_pty_activity);
+            let elapsed = now.signed_duration_since(effective_last);
             let elapsed_ms = elapsed.num_milliseconds();
 
             if let Some(ref tool) = session.active_tool {
@@ -1539,7 +1572,8 @@ mod tests {
         // Force last_activity into the past so the timeout matches.
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
-
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::seconds(30);
         // First check banks a strike but does NOT flip — the confirmation
         // gate suppresses single-tick LLM-gap flicker. Second check (no
         // intervening event to reset strikes) crosses the threshold.
@@ -1564,7 +1598,8 @@ mod tests {
         // Push activity back so the duration check would otherwise trigger.
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(60);
-
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::seconds(60);
         let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert!(transitioned.is_empty());
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
@@ -1584,7 +1619,8 @@ mod tests {
         // Force last_activity into the past.
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(60);
-
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::seconds(60);
         for status in [
             SessionStatus::Idle,
             SessionStatus::WaitingForInput,
@@ -1619,6 +1655,9 @@ mod tests {
 
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
+
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::seconds(30);
         // Two consecutive checks needed (confirmation gate).
         assert!(
             state
@@ -1649,6 +1688,9 @@ mod tests {
         assert!(state.sessions["s1"].active_tool.is_some());
 
         state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
             Utc::now() - chrono::Duration::seconds(30);
         // Two consecutive checks needed (confirmation gate).
         assert!(
@@ -1685,6 +1727,8 @@ mod tests {
         state.apply_event(tool);
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(60);
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::seconds(60);
         let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert!(transitioned.is_empty());
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
@@ -1712,6 +1756,8 @@ mod tests {
         state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::seconds(30);
         // Two consecutive checks needed (confirmation gate).
         state.apply_pending_timeout(chrono::Duration::seconds(10));
         state.apply_pending_timeout(chrono::Duration::seconds(10));
@@ -1734,6 +1780,8 @@ mod tests {
         state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
         state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
         state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
             Utc::now() - chrono::Duration::seconds(30);
         // Two consecutive checks needed (confirmation gate).
         state.apply_pending_timeout(chrono::Duration::seconds(10));
@@ -1763,7 +1811,8 @@ mod tests {
         state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
-
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::seconds(30);
         // First check: stale, but only one strike — no flip yet.
         let first = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert!(
@@ -1795,7 +1844,8 @@ mod tests {
         state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(30);
-
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::seconds(30);
         // Bank one strike while Working.
         state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert_eq!(state.sessions["s1"].pending_strikes, 1);
@@ -1822,6 +1872,8 @@ mod tests {
         // last_activity in the future = clock moved backward.
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() + chrono::Duration::seconds(60);
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() + chrono::Duration::seconds(60);
         let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert!(transitioned.is_empty());
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
@@ -1843,6 +1895,8 @@ mod tests {
         // Simulate ~48h of laptop sleep.
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::hours(48);
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::hours(48);
         let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert!(
             transitioned.is_empty(),
@@ -1863,6 +1917,8 @@ mod tests {
         state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
         state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
         state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::hours(23);
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
             Utc::now() - chrono::Duration::hours(23);
         // Two consecutive checks needed (confirmation gate).
         assert!(
@@ -2014,7 +2070,8 @@ mod tests {
         // trigger.
         state.sessions.get_mut("s1").unwrap().last_activity =
             Utc::now() - chrono::Duration::seconds(60);
-
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::seconds(60);
         let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
         assert!(transitioned.is_empty());
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
@@ -2122,5 +2179,93 @@ mod tests {
         let mut ev = make_event(session_id, event_type);
         ev.pane_id = Some(pane_id.to_string());
         ev
+    }
+
+    #[test]
+    fn pending_timeout_skipped_by_recent_last_pty_activity() {
+        // last_activity is stale (60s ago) so the hook-event clock has
+        // crossed the timeout, but last_pty_activity is fresh (1s ago) —
+        // the agent is streaming response tokens. apply_pending_timeout
+        // must use max(last_activity, last_pty_activity) and treat the
+        // session as still working.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+
+        let now = Utc::now();
+        {
+            let s = state.sessions.get_mut("s1").unwrap();
+            s.last_activity = now - chrono::Duration::seconds(60);
+            s.last_pty_activity = now - chrono::Duration::seconds(1);
+        }
+
+        // Two consecutive ticks would normally cross the strike gate,
+        // but the PTY-byte freshness suppresses both.
+        let first = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(first.is_empty());
+        let second = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(second.is_empty());
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn pending_timeout_fires_when_both_last_activity_and_pty_are_stale() {
+        // last_activity AND last_pty_activity both 60s ago — no streaming,
+        // no hook events. Genuine stall; must flip after the strike gate.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
+        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
+
+        let now = Utc::now();
+        {
+            let s = state.sessions.get_mut("s1").unwrap();
+            s.last_activity = now - chrono::Duration::seconds(60);
+            s.last_pty_activity = now - chrono::Duration::seconds(60);
+        }
+
+        let first = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert!(first.is_empty()); // strike #1
+        let second = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert_eq!(second, vec!["s1".to_string()]); // strike #2 → flip
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
+    }
+
+    #[test]
+    fn bump_pty_activity_only_updates_sessions_bound_to_pane() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.register_pane("p2".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        state.apply_event(make_event_with_pane("s2", EventType::SessionStart, "p2"));
+
+        let baseline = Utc::now() - chrono::Duration::seconds(120);
+        for s in state.sessions.values_mut() {
+            s.last_pty_activity = baseline;
+        }
+
+        let bump_to = Utc::now();
+        state.bump_pty_activity("p1", bump_to);
+
+        // s1 bound to p1 — bumped. s2 bound to p2 — untouched.
+        assert_eq!(state.sessions["s1"].last_pty_activity, bump_to);
+        assert_eq!(state.sessions["s2"].last_pty_activity, baseline);
+    }
+
+    #[test]
+    fn bump_pty_activity_never_goes_backward() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+
+        let now = Utc::now();
+        state.sessions.get_mut("s1").unwrap().last_pty_activity = now;
+
+        // Try to bump backward — must be a no-op (only `at > current` updates).
+        state.bump_pty_activity("p1", now - chrono::Duration::seconds(30));
+        assert_eq!(state.sessions["s1"].last_pty_activity, now);
     }
 }
