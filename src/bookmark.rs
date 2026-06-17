@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::dirs_home;
+use crate::event::AgentType;
 
 /// A single bookmarked Copilot CLI session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +29,19 @@ pub struct Bookmark {
     pub note: String,
     /// When the bookmark was first created or last updated.
     pub updated_at: DateTime<Utc>,
+    /// Original launch command of the bookmarked pane (e.g.
+    /// `agency copilot --allow-all`), captured at create time so re-opening
+    /// the bookmark preserves the user's wrapper and permission flags rather
+    /// than spawning a bare `copilot --resume <id>`. `None` for legacy
+    /// bookmarks written before this field existed — those fall back to the
+    /// bare-resume command on open.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Agent type of the bookmarked session, paired with `command` so the
+    /// `--resume <id>` rewrite can be validated per-agent (see
+    /// `config::build_resume_command`). `None` for legacy bookmarks.
+    #[serde(default)]
+    pub agent_type: Option<AgentType>,
 }
 
 /// Resolve `~/.config/dot-agent-deck/bookmarked-sessions.json`, overridable
@@ -207,6 +221,8 @@ mod tests {
             session_name: format!("session-{id}"),
             note: note.into(),
             updated_at: Utc::now(),
+            command: None,
+            agent_type: None,
         }
     }
 
