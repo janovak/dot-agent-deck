@@ -3688,7 +3688,8 @@ pub fn run_tui(
 
         // Drain all pending events before re-rendering. This avoids a full
         // render cycle between each keystroke, which eliminates perceived typing
-        // latency in PaneInput mode.
+        // latency in PaneInput mode. The 16ms poll timeout caps idle wakeups at
+        // ~60 FPS while still draining bursts of input promptly.
         if !crossterm::event::poll(std::time::Duration::from_millis(16))? {
             continue;
         }
@@ -5106,41 +5107,49 @@ pub fn run_tui(
                     }
                 }
                 KeyResult::ForwardToPane(bytes) => {
-                    // Decide whether this key should be batched into a
-                    // paste-burst buffer or written immediately. Burst-capable
-                    // keys are plain printable Char and Enter without
-                    // Ctrl/Alt — exactly the kinds of keystrokes that arrive
-                    // when a terminal feeds clipboard text into the input
-                    // queue as individual key presses (Windows Terminal does
-                    // this even when bracketed-paste mode is enabled, in
-                    // which case `Event::Paste` never fires).
-                    let burstable = ui.mode == UiMode::PaneInput
-                        && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
-                        && !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT);
-                    if burstable {
-                        pane_input_burst.extend_from_slice(&bytes);
-                        pane_input_burst_keys += 1;
-                    } else if let Some(embedded) =
-                        pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                    // Burstable keys — plain printable Char, Enter, and Tab
+                    // without Ctrl/Alt — are exactly what a terminal emits when
+                    // it floods clipboard text into the input queue as
+                    // individual key presses. Windows Terminal does this for
+                    // Ctrl+V even when bracketed-paste mode is enabled (no
+                    // `Event::Paste` fires; instead the content arrives as a
+                    // keystroke flood followed by a trailing Ctrl+V Release).
+                    // Collect burstable keys into `pane_input_burst` so a
+                    // multi-key flood is flushed once, as a bracketed paste, at
+                    // the end of the drain loop — preventing the embedded
+                    // newlines from auto-submitting each line at the agent.
+                    //
+                    // Non-burstable keys (control combos, arrows, function
+                    // keys) flush any pending burst and write immediately so
+                    // interactive latency is unaffected.
+                    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
                         && let Some(pane_id) = embedded.focused_pane_id()
                     {
-                        // Non-burstable key (Ctrl+X, arrows, function keys,
-                        // etc.) — flush any pending burst first so paste-text
-                        // and the editing key arrive in the right order, then
-                        // write this key immediately.
-                        flush_pane_input_burst(
-                            &mut pane_input_burst,
-                            &mut pane_input_burst_keys,
-                            embedded,
-                            &pane_id,
-                            &mut ui,
-                            &snapshot,
-                        );
-                        embedded.reset_scrollback(&pane_id);
-                        if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
-                            ui.status_message =
-                                Some((format!("PTY write failed: {e}"), std::time::Instant::now()));
+                        let burstable = !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab);
+                        if burstable {
+                            pane_input_burst.extend_from_slice(&bytes);
+                            pane_input_burst_keys = pane_input_burst_keys.saturating_add(1);
+                        } else {
+                            // Flush any pending paste burst first so paste-text
+                            // and this keystroke arrive in the right order.
+                            flush_pane_input_burst(
+                                &mut pane_input_burst,
+                                &mut pane_input_burst_keys,
+                                embedded,
+                                &pane_id,
+                                &mut ui,
+                                &snapshot,
+                            );
+                            embedded.reset_scrollback(&pane_id);
+                            if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
+                                ui.status_message = Some((
+                                    format!("PTY write failed: {e}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
                         }
                     }
                 }
