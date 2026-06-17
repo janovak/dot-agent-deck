@@ -33,7 +33,7 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     (
         "pending.timeout_seconds",
-        "Seconds in Working before card flips to Pending (default: 30, set to 0 to disable)",
+        "Seconds in Working before card flips to Pending (default: 10, set to 0 to disable)",
     ),
     (
         "idle_art.enabled",
@@ -162,12 +162,13 @@ impl Default for PendingConfig {
             // is also produced by long pure-LLM-thinking gaps — common with
             // reasoning models and slow Copilot CLI responses. A 10 s
             // default false-positived during normal mid-conversation gaps,
-            // causing visible Pending → Working flicker. 30 s comfortably
-            // exceeds typical LLM silence between tool calls while still
-            // catching true stalls within half a minute. Users can tune
-            // back down with `pending.timeout_seconds` or disable the
-            // heuristic with `0`.
-            timeout_seconds: 30,
+            // With PTY-byte activity tracking (commit 8315bd2), the timeout
+            // can be more aggressive — streaming response tokens keep the
+            // PTY active and suppress false-positive Pending flips. 10 s
+            // comfortably catches true user-input waits (e.g. Copilot CLI's
+            // ask_user prompts) while avoiding flicker during normal LLM gaps.
+            // Users can tune via `pending.timeout_seconds` or disable with `0`.
+            timeout_seconds: 10,
         }
     }
 }
@@ -1279,15 +1280,15 @@ on_idle = true
     }
 
     #[test]
-    fn pending_timeout_seconds_default_is_30() {
+    fn pending_timeout_seconds_default_is_10() {
         let cfg = PendingConfig::default();
-        assert_eq!(cfg.timeout_seconds, 30);
+        assert_eq!(cfg.timeout_seconds, 10);
     }
 
     #[test]
     fn pending_timeout_get_set_field() {
         let mut dc = DashboardConfig::default();
-        assert_eq!(dc.get_field("pending.timeout_seconds").unwrap(), "30");
+        assert_eq!(dc.get_field("pending.timeout_seconds").unwrap(), "10");
         dc.set_field("pending.timeout_seconds", "25").unwrap();
         assert_eq!(dc.pending.timeout_seconds, 25);
         // Zero disables the feature.
