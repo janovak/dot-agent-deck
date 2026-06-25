@@ -292,6 +292,7 @@ impl AppState {
             //     as before.
             if is_placeholder_session_id(&existing_id)
                 && !is_placeholder_session_id(&event.session_id)
+                && !is_tool_call_id(&event.session_id)
             {
                 if let Some(mut moved) = self.sessions.remove(&existing_id) {
                     moved.session_id = event.session_id.clone();
@@ -308,7 +309,19 @@ impl AppState {
                 // diverge from here on; callers that need the live id
                 // — like `SavedSession::snapshot` — must read the
                 // field, not the key.)
-                if let Some(s) = self.sessions.get_mut(&existing_id) {
+                //
+                // EXCEPTION: subagent hook events run in the parent's
+                // pane but carry the spawning *tool-call id*
+                // (`toolu_…`/`call_…`) as their sessionId, not a
+                // resumable session GUID. They must still update the
+                // parent card (status, subagent counters) via the event
+                // rewrite below, but must NOT overwrite the canonical
+                // `session_id` — otherwise workspace/bookmark resume
+                // saves `copilot --resume toolu_…`, which the agent
+                // rejects with "No session or name matched '…'".
+                if !is_tool_call_id(&event.session_id)
+                    && let Some(s) = self.sessions.get_mut(&existing_id)
+                {
                     s.session_id = event.session_id.clone();
                 }
                 let old_id = std::mem::replace(&mut event.session_id, existing_id);
@@ -736,6 +749,24 @@ pub fn is_placeholder_session_id(id: &str) -> bool {
 }
 
 const PLACEHOLDER_SESSION_ID_PREFIX: &str = "pane-";
+
+/// Returns true when `id` looks like an LLM *tool-call* identifier rather
+/// than a resumable agent session id.
+///
+/// Copilot CLI runs subagents in the same pane as their parent, and those
+/// subagent hook events arrive carrying the spawning **tool-call id** in the
+/// `sessionId` field instead of a real session GUID. The two providers
+/// Copilot CLI fronts use distinct, stable prefixes: Anthropic models emit
+/// `toolu_…` and OpenAI models emit `call_…`.
+///
+/// Such an id must never be written to `SessionState::session_id` or saved
+/// for resume: workspace/bookmark restore would build
+/// `copilot --resume toolu_…`, which the CLI rejects with
+/// "No session or name matched '…'". Real Copilot/Claude session ids are
+/// UUID-shaped and never collide with these prefixes.
+pub fn is_tool_call_id(id: &str) -> bool {
+    id.starts_with("toolu_") || id.starts_with("call_")
+}
 
 #[cfg(test)]
 mod tests {
@@ -1440,6 +1471,66 @@ mod tests {
             state.sessions["real-uuid-A"].session_id, "real-uuid-B",
             "session_id field must update to the live id after restart"
         );
+    }
+
+    #[test]
+    fn subagent_tool_call_id_does_not_corrupt_canonical_session_id() {
+        // Regression: Copilot CLI subagents run in the parent's pane and
+        // fire hook events whose `sessionId` is the spawning *tool-call
+        // id* (`toolu_…` / `call_…`), not a resumable session GUID.
+        // Before the fix these hit the "real → real restart" branch and
+        // overwrote the parent's canonical `session_id`, so workspace /
+        // bookmark resume later saved `copilot --resume toolu_…` and the
+        // CLI rejected it with "No session or name matched '…'".
+        let mut state = AppState::default();
+        state.register_pane("7".to_string());
+
+        let real_uuid = "0dc83c83-3bd6-4fb8-83c1-c8d25d820f86";
+        let mut start = make_event(real_uuid, EventType::SessionStart);
+        start.agent_type = AgentType::CopilotCli;
+        start.pane_id = Some("7".to_string());
+        state.apply_event(start);
+        assert!(state.sessions.contains_key(real_uuid));
+
+        // A subagent tool event arrives on the SAME pane carrying a
+        // tool-call id as its session id (both Anthropic `toolu_` and
+        // OpenAI `call_` shapes occur depending on the active model).
+        for tool_call_id in [
+            "toolu_018dZ3HtuEnKRQfjGwaGZEFc",
+            "call_GGpCiUtRHsZ9gtsmEusrlbHH",
+        ] {
+            let mut sub = make_event(tool_call_id, EventType::ToolStart);
+            sub.agent_type = AgentType::CopilotCli;
+            sub.pane_id = Some("7".to_string());
+            sub.tool_name = Some("Bash".to_string());
+            state.apply_event(sub);
+
+            // The event is still attributed to the parent card (status
+            // updates) — but the canonical id must stay the real UUID.
+            assert!(
+                state.sessions.contains_key(real_uuid),
+                "parent card must remain keyed by the real UUID"
+            );
+            assert!(
+                !state.sessions.contains_key(tool_call_id),
+                "no spurious card should be created under the tool-call id"
+            );
+            assert_eq!(
+                state.sessions[real_uuid].session_id, real_uuid,
+                "canonical session_id must NOT be overwritten by a tool-call id"
+            );
+        }
+    }
+
+    #[test]
+    fn is_tool_call_id_recognises_tool_call_ids() {
+        // Anthropic + OpenAI tool-call id prefixes Copilot CLI surfaces.
+        assert!(is_tool_call_id("toolu_018dZ3HtuEnKRQfjGwaGZEFc"));
+        assert!(is_tool_call_id("call_GGpCiUtRHsZ9gtsmEusrlbHH"));
+        // Real session ids (UUID-shaped) and placeholders are NOT tool calls.
+        assert!(!is_tool_call_id("0dc83c83-3bd6-4fb8-83c1-c8d25d820f86"));
+        assert!(!is_tool_call_id("pane-3"));
+        assert!(!is_tool_call_id(""));
     }
 
     #[test]

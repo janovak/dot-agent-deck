@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::event::AgentType;
-use crate::state::{SessionState, SessionStatus, is_placeholder_session_id};
+use crate::state::{SessionState, SessionStatus, is_placeholder_session_id, is_tool_call_id};
 use crate::theme::Theme;
 
 pub const CONFIG_KEYS: &[(&str, &str)] = &[
@@ -606,12 +606,20 @@ impl SavedSession {
             // always have both set, but checking the id shape too
             // catches the (theoretical) case where someone forgets to
             // set agent_type when constructing a placeholder.
+            //
+            // The `is_tool_call_id` guard is a second safety net: a
+            // subagent's tool-call id (`toolu_…`/`call_…`) must never be
+            // persisted as a resume target. `apply_event` already keeps
+            // it out of the canonical `session_id`; this ensures even a
+            // legacy/corrupted snapshot field can't round-trip into a
+            // broken `--resume toolu_…` command.
             let matching = sessions
                 .values()
                 .filter(|s| {
                     s.pane_id.as_deref() == Some(id.as_str())
                         && s.agent_type != AgentType::None
                         && !is_placeholder_session_id(&s.session_id)
+                        && !is_tool_call_id(&s.session_id)
                 })
                 .max_by_key(|s| s.last_activity);
             if let Some(s) = matching {
