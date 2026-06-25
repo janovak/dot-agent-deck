@@ -790,6 +790,15 @@ pub fn build_resume_command(
     if !is_safe_session_id(sid) {
         return base.to_string();
     }
+    // A tool-call id (`toolu_…`/`call_…`) is shell-safe but is NOT a
+    // resumable session — it can leak into a saved snapshot via a
+    // subagent hook event (see `state::is_tool_call_id`). Refuse to
+    // build `--resume toolu_…`; fall back to a fresh session so a
+    // legacy/corrupted snapshot opens cleanly instead of producing a
+    // command the agent rejects with "No session or name matched '…'".
+    if is_tool_call_id(sid) {
+        return base.to_string();
+    }
     let stripped = strip_resume_flag(base);
     let trimmed = stripped.trim();
     format!("{trimmed} --resume {sid}")
@@ -2330,6 +2339,26 @@ timeout_secs = 600
             build_resume_command(cmd, Some("abc-123_DEF-456"), Some(&AgentType::CopilotCli)),
             "copilot --resume abc-123_DEF-456"
         );
+    }
+
+    #[test]
+    fn build_resume_command_rejects_tool_call_ids() {
+        // A subagent tool-call id (`toolu_…`/`call_…`) is shell-safe but
+        // isn't a resumable session. If one leaked into a legacy/corrupted
+        // snapshot, restore must fall back to a fresh session rather than
+        // emit `--resume toolu_…`, which the agent rejects with
+        // "No session or name matched '…'".
+        let cmd = "agency copilot --allow-all";
+        for sid in [
+            "toolu_018dZ3HtuEnKRQfjGwaGZEFc",
+            "call_GGpCiUtRHsZ9gtsmEusrlbHH",
+        ] {
+            assert_eq!(
+                build_resume_command(cmd, Some(sid), Some(&AgentType::CopilotCli)),
+                cmd,
+                "must refuse to resume a tool-call id: {sid:?}"
+            );
+        }
     }
 
     #[test]
