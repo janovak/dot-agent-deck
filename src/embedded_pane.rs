@@ -345,40 +345,11 @@ impl EmbeddedPaneController {
                         scan_mouse_mode(data, &mouse_mode_clone);
 
                         let segments = osc8.process(data);
-                        let mut new_links: Vec<(u16, String)> = Vec::new();
-                        let mut scroll_amount: u16 = 0;
-
-                        if let Ok(mut p) = parser_clone.lock() {
-                            let max_row = p.screen().size().0.saturating_sub(1);
-                            for segment in &segments {
-                                match segment {
-                                    Osc8Segment::Text(bytes) => {
-                                        let rb = p.screen().cursor_position().0;
-                                        p.process(bytes);
-                                        let ra = p.screen().cursor_position().0;
-                                        if rb >= max_row && ra >= max_row {
-                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
-                                                as u16;
-                                            scroll_amount += nl;
-                                        }
-                                    }
-                                    Osc8Segment::LinkedText { url, bytes } => {
-                                        // cursor_before is the row where link text starts
-                                        let row = p.screen().cursor_position().0;
-                                        let rb = row;
-                                        p.process(bytes);
-                                        let ra = p.screen().cursor_position().0;
-                                        new_links.push((row, url.clone()));
-                                        if rb >= max_row && ra >= max_row {
-                                            let nl = bytes.iter().filter(|&&b| b == b'\n').count()
-                                                as u16;
-                                            scroll_amount += nl;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // parser lock released
+                        let (new_links, scroll_amount) = if let Ok(mut p) = parser_clone.lock() {
+                            apply_osc8_segments(&mut p, &segments)
+                        } else {
+                            (Vec::new(), 0)
+                        };
 
                         if (!new_links.is_empty() || scroll_amount > 0)
                             && let Ok(mut hmap) = hyperlinks_clone.lock()
@@ -458,6 +429,65 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// Feed OSC-8 filter segments to the vt100 `parser`, advancing the screen
+/// and computing:
+///   * `new_links`: the `(row, url)` associations to record in the
+///     [`HyperlinkMap`], and
+///   * `scroll_amount`: how many rows scrolled off the top while writing at
+///     the bottom of the screen (so the caller can `shift_up` the map).
+///
+/// A hyperlink's *visible text* can wrap across multiple rows when the URL
+/// is longer than the pane is wide. Every row the link text occupies is
+/// recorded — not just the starting row — so a Ctrl+click on any wrapped
+/// row resolves to the full URL. Recording only the starting row (the prior
+/// behaviour) left continuation rows with no OSC-8 entry, so clicking them
+/// fell through to plain-text URL extraction, which truncates the URL at the
+/// line-wrap boundary.
+fn apply_osc8_segments(
+    parser: &mut vt100::Parser,
+    segments: &[Osc8Segment],
+) -> (Vec<(u16, String)>, u16) {
+    let mut new_links: Vec<(u16, String)> = Vec::new();
+    let mut scroll_amount: u16 = 0;
+    let max_row = parser.screen().size().0.saturating_sub(1);
+    for segment in segments {
+        match segment {
+            Osc8Segment::Text(bytes) => {
+                let rb = parser.screen().cursor_position().0;
+                parser.process(bytes);
+                let ra = parser.screen().cursor_position().0;
+                if rb >= max_row && ra >= max_row {
+                    let nl = bytes.iter().filter(|&&b| b == b'\n').count() as u16;
+                    scroll_amount += nl;
+                }
+            }
+            Osc8Segment::LinkedText { url, bytes } => {
+                let rb = parser.screen().cursor_position().0;
+                parser.process(bytes);
+                let ra = parser.screen().cursor_position().0;
+                // Register every row the link text occupies. When the text
+                // wraps within the visible screen, `ra >= rb` and we record
+                // `rb..=ra`. When it wraps past the bottom and scrolls,
+                // `ra <= rb`; fall back to the starting row and let
+                // `scroll_amount` + `shift_up` keep it aligned (parity with
+                // the pre-multirow behaviour for the bottom-of-screen case).
+                if ra >= rb {
+                    for r in rb..=ra {
+                        new_links.push((r, url.clone()));
+                    }
+                } else {
+                    new_links.push((rb, url.clone()));
+                }
+                if rb >= max_row && ra >= max_row {
+                    let nl = bytes.iter().filter(|&&b| b == b'\n').count() as u16;
+                    scroll_amount += nl;
+                }
+            }
+        }
+    }
+    (new_links, scroll_amount)
 }
 
 /// Cross-platform default-shell selection used when no explicit command is
@@ -761,6 +791,85 @@ mod tests {
         assert!(!contents.trim().is_empty());
 
         ctrl.close_pane(&id).unwrap();
+    }
+
+    #[test]
+    fn osc8_multirow_link_registers_every_wrapped_row() {
+        // A URL longer than the pane is wide wraps its visible link text
+        // across multiple rows. Every occupied row must map to the FULL
+        // url so a Ctrl+click on any wrapped row opens the whole link —
+        // not a plain-text-truncated prefix cut at the wrap. Regression
+        // guard for the "clicking a wrapped OSC-8 link opens a truncated
+        // URL" bug.
+        let mut parser = vt100::Parser::new(24, 20, 0);
+        let url = "https://portal.example.com/dashboard/Team/Service/ONS%20Ship";
+        let segments = vec![Osc8Segment::LinkedText {
+            url: url.to_string(),
+            bytes: url.as_bytes().to_vec(),
+        }];
+        let (links, scroll) = apply_osc8_segments(&mut parser, &segments);
+
+        assert_eq!(scroll, 0, "mid-screen link should not scroll");
+        let rows: Vec<u16> = links.iter().map(|(r, _)| *r).collect();
+        assert!(
+            rows.len() >= 2,
+            "a URL wider than the pane must register multiple rows, got {rows:?}"
+        );
+        assert_eq!(rows.first(), Some(&0), "link starts on row 0");
+        for w in rows.windows(2) {
+            assert_eq!(
+                w[1],
+                w[0] + 1,
+                "registered rows must be contiguous: {rows:?}"
+            );
+        }
+        assert!(
+            links.iter().all(|(_, u)| u == url),
+            "every wrapped row must carry the full URL"
+        );
+    }
+
+    #[test]
+    fn osc8_single_row_link_registers_one_row() {
+        // A short link that fits on one row registers exactly that row —
+        // no over-registration of neighbouring rows.
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let url = "https://example.com/x";
+        let segments = vec![Osc8Segment::LinkedText {
+            url: url.to_string(),
+            bytes: url.as_bytes().to_vec(),
+        }];
+        let (links, scroll) = apply_osc8_segments(&mut parser, &segments);
+
+        assert_eq!(scroll, 0);
+        assert_eq!(links, vec![(0u16, url.to_string())]);
+    }
+
+    #[test]
+    fn osc8_link_after_text_registers_correct_starting_row() {
+        // A wrapping link that begins partway down the screen (after
+        // preceding text lines) must register its rows starting from the
+        // link's actual starting row, not row 0.
+        let mut parser = vt100::Parser::new(24, 20, 0);
+        let segments = vec![
+            Osc8Segment::Text(b"line0\r\nline1\r\n".to_vec()),
+            Osc8Segment::LinkedText {
+                url: "https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                bytes: b"https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec(),
+            },
+        ];
+        let (links, _) = apply_osc8_segments(&mut parser, &segments);
+
+        let rows: Vec<u16> = links.iter().map(|(r, _)| *r).collect();
+        assert_eq!(
+            rows.first(),
+            Some(&2),
+            "link starts on row 2 after two text lines"
+        );
+        assert!(rows.len() >= 2, "long link should still wrap: {rows:?}");
+        for w in rows.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "rows contiguous: {rows:?}");
+        }
     }
 
     #[test]
