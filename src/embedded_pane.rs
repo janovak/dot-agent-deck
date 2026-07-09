@@ -467,22 +467,35 @@ fn apply_osc8_segments(
                 let rb = parser.screen().cursor_position().0;
                 parser.process(bytes);
                 let ra = parser.screen().cursor_position().0;
-                // Register every row the link text occupies. When the text
-                // wraps within the visible screen, `ra >= rb` and we record
-                // `rb..=ra`. When it wraps past the bottom and scrolls,
-                // `ra <= rb`; fall back to the starting row and let
-                // `scroll_amount` + `shift_up` keep it aligned (parity with
-                // the pre-multirow behaviour for the bottom-of-screen case).
-                if ra >= rb {
-                    for r in rb..=ra {
-                        new_links.push((r, url.clone()));
+                // Register every row the link's wrapped text occupies, using
+                // the POST-processing screen state. A URL that wraps at the
+                // bottom of the viewport scrolls it *during* processing, which
+                // invalidates the pre-processing cursor row `rb` (the link's
+                // top row moves up by the scrolled amount) and carries no
+                // newline for the scroll detector to see. So instead of the
+                // fragile `rb..=ra`, walk UP from the final row `ra` through
+                // contiguous auto-wrapped rows (`row_wrapped`) to find the
+                // link's true top row. Regression: clicking the first wrapped
+                // row opened a truncated URL because that row had no entry.
+                let mut top = ra;
+                {
+                    let screen = parser.screen();
+                    while top > 0 && screen.row_wrapped(top - 1) {
+                        top -= 1;
                     }
-                } else {
-                    new_links.push((rb, url.clone()));
                 }
-                if rb >= max_row && ra >= max_row {
-                    let nl = bytes.iter().filter(|&&b| b == b'\n').count() as u16;
-                    scroll_amount += nl;
+                for r in top..=ra {
+                    new_links.push((r, url.clone()));
+                }
+                // A viewport scroll during this segment pushes any previously
+                // registered links up by `rb - top`; surface it so the caller
+                // shifts the existing map before inserting these rows. (No
+                // effect on this link's rows, which are already post-scroll.)
+                // Only when the cursor actually reached the bottom — otherwise
+                // no scroll happened and `rb - top` would be a phantom shift
+                // (e.g. a link that merely follows wrapped prose on one line).
+                if ra >= max_row {
+                    scroll_amount += rb.saturating_sub(top);
                 }
             }
         }
@@ -869,6 +882,60 @@ mod tests {
         assert!(rows.len() >= 2, "long link should still wrap: {rows:?}");
         for w in rows.windows(2) {
             assert_eq!(w[1], w[0] + 1, "rows contiguous: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn osc8_wrapping_link_at_bottom_registers_every_visible_row() {
+        // Regression: a URL that wraps at the BOTTOM of the screen scrolls the
+        // viewport *during* processing. The pre-processing cursor row is then
+        // stale, so the old `rb..=ra` registration missed the link's true top
+        // row(s) — clicking them fell through to plain-text URL extraction,
+        // which truncates at the wrap. Every row the link is *drawn* on must
+        // resolve to the full URL.
+        let rows = 6u16;
+        let cols = 10u16;
+        let mut parser = vt100::Parser::new(rows, cols, 100);
+        // Push the cursor down near the bottom so the link wraps past it.
+        parser.process(b"a\r\nb\r\nc\r\nd\r\n");
+        let url = "https://ex.com/abcdefghij"; // 25 chars -> 3 rows at 10 cols
+        let raw = format!("\x1b]8;;{url}\x07{url}\x1b]8;;\x07");
+        let mut filter = Osc8Filter::new();
+        let segments = filter.process(raw.as_bytes());
+        let (links, scroll) = apply_osc8_segments(&mut parser, &segments);
+        let mut map = HyperlinkMap::new();
+        if scroll > 0 {
+            map.shift_up(scroll);
+        }
+        for (r, u) in &links {
+            map.set_row(*r, u);
+        }
+
+        // Every visible row whose cells contain link text must map to the
+        // FULL url (not a plain-text-truncated prefix).
+        let screen = parser.screen();
+        let mut link_rows_on_screen = Vec::new();
+        for row in 0..rows {
+            let mut line = String::new();
+            for col in 0..cols {
+                if let Some(cell) = screen.cell(row, col) {
+                    line.push_str(cell.contents());
+                }
+            }
+            if line.contains("https") || line.contains(".com") || line.contains("fghij") {
+                link_rows_on_screen.push(row);
+            }
+        }
+        assert!(
+            link_rows_on_screen.len() >= 3,
+            "link should be drawn across >=3 rows, got {link_rows_on_screen:?}"
+        );
+        for row in &link_rows_on_screen {
+            assert_eq!(
+                map.get_row(*row),
+                Some(url),
+                "row {row} is drawn with link text but not registered (link_rows={link_rows_on_screen:?})",
+            );
         }
     }
 
