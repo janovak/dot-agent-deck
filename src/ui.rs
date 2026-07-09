@@ -1729,6 +1729,147 @@ fn extract_url_at_column(row_text: &str, col: u16) -> Option<String> {
     }
 }
 
+/// A character that can appear in the body of a URL (matches the body charset
+/// of the `extract_url_at_column` regex: not whitespace, not a bracket/quote).
+fn is_url_char(c: char) -> bool {
+    !c.is_whitespace()
+        && !matches!(
+            c,
+            '<' | '>' | '"' | '`' | '\'' | '(' | ')' | '{' | '}' | '[' | ']'
+        )
+}
+
+/// One screen row's text with trailing agent-frame glyphs and whitespace
+/// removed, so the last character reflects real content (used to tell whether
+/// a URL runs to the row's right edge and therefore wraps onto the next row).
+fn row_content_trimmed(screen: &vt100::Screen, row: u16) -> String {
+    read_screen_row_text(screen, row)
+        .trim_end_matches(|c: char| is_pty_frame_glyph(c) || c == ' ' || c == '\t')
+        .to_string()
+}
+
+/// Strip a left gutter/indent (leading whitespace, then at most one box-drawing
+/// frame glyph, then whitespace) from a wrapped continuation row, returning the
+/// remaining content and how many characters were stripped.
+fn strip_leading_gutter(s: &str) -> (&str, usize) {
+    let after_ws = s.trim_start_matches([' ', '\t']);
+    let mut chars = after_ws.chars();
+    if let Some(c0) = chars.next()
+        && is_pty_frame_glyph(c0)
+    {
+        let rest = chars.as_str().trim_start_matches([' ', '\t']);
+        return (rest, s.chars().count() - rest.chars().count());
+    }
+    (after_ws, s.chars().count() - after_ws.chars().count())
+}
+
+/// Reconstruct a URL that wraps across multiple screen rows, for the plain-text
+/// (non-OSC-8) Ctrl+click fallback. Agents such as Copilot CLI print URLs as
+/// styled plain text with **no** OSC-8 escape, and a long URL wraps across
+/// several rows; the single-row [`extract_url_at_column`] truncates it at the
+/// first wrap. This walks the wrapped rows — tolerating a left gutter/indent on
+/// continuation rows — and rejoins the full URL.
+///
+/// A row's URL "wraps" onto the next when the URL run is the trailing content
+/// of the row (nothing but frame/whitespace after it). Stitching stops at a row
+/// whose leading run begins a fresh `http(s)://` scheme (a *different* URL) or
+/// that doesn't continue the run.
+fn extract_wrapped_url_at(screen: &vt100::Screen, screen_row: u16, col: u16) -> Option<String> {
+    let (nrows, ncols) = screen.size();
+    if screen_row >= nrows {
+        return None;
+    }
+
+    // Leading URL run of a (continuation) row after its gutter, plus the column
+    // where that run starts and whether it opens a fresh scheme.
+    let leading_run = |row: u16| -> (String, usize, bool) {
+        let content = row_content_trimmed(screen, row);
+        let (after, gutter) = strip_leading_gutter(&content);
+        let run: String = after.chars().take_while(|&c| is_url_char(c)).collect();
+        let has_scheme = run.starts_with("http://") || run.starts_with("https://");
+        (run, gutter, has_scheme)
+    };
+    // Does the row wrap onto the next row *mid-URL*? Definitively true when
+    // vt100 marks it auto-wrapped; otherwise (an agent that hard-wraps with its
+    // own newline + indent) require the content to end in a URL char AND reach
+    // near the right edge, so a URL that merely ends a short line isn't stitched
+    // onto unrelated following text.
+    let wraps_to_next = |row: u16| -> bool {
+        if screen.row_wrapped(row) {
+            return true;
+        }
+        let content = row_content_trimmed(screen, row);
+        let len = content.chars().count() as u16;
+        content.chars().last().is_some_and(is_url_char) && len + 3 >= ncols
+    };
+
+    // Find the start row: the row holding the scheme for the clicked URL.
+    let this_text = read_screen_row_text(screen, screen_row);
+    let start_row = if extract_url_at_column(&this_text, col).is_some() {
+        screen_row
+    } else {
+        // Clicked a continuation row: the click must land on its leading URL
+        // run, then walk up to the scheme row.
+        let (run, gutter, _) = leading_run(screen_row);
+        let c = col as usize;
+        if run.is_empty() || c < gutter || c >= gutter + run.chars().count() {
+            return None;
+        }
+        let mut r = screen_row;
+        loop {
+            let rtext = read_screen_row_text(screen, r);
+            if rtext.contains("http://") || rtext.contains("https://") {
+                break;
+            }
+            if r == 0 || !wraps_to_next(r - 1) {
+                return None;
+            }
+            r -= 1;
+        }
+        r
+    };
+
+    // Seed with the scheme URL on the start row (its run reaches the content
+    // edge when it wraps). If the click was on the start row, prefer the match
+    // under the cursor; otherwise take the last scheme match on the row.
+    let start_text = read_screen_row_text(screen, start_row);
+    let mut url = if start_row == screen_row {
+        extract_url_at_column(&start_text, col)
+    } else {
+        None
+    }
+    .or_else(|| {
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = RE.get_or_init(|| regex::Regex::new(r#"https?://[^\s<>"`'(){}\[\]]+"#).unwrap());
+        re.find_iter(&start_text)
+            .last()
+            .map(|m| m.as_str().to_string())
+    })?;
+
+    // Stitch forward across wrapped continuation rows.
+    if wraps_to_next(start_row) {
+        let mut r = start_row + 1;
+        while r < nrows {
+            let (run, _gutter, has_scheme) = leading_run(r);
+            if run.is_empty() || has_scheme {
+                break;
+            }
+            url.push_str(&run);
+            if !wraps_to_next(r) {
+                break;
+            }
+            r += 1;
+        }
+    }
+
+    let trimmed = url.trim_end_matches(|c: char| ".,;:!?)]}>\"'".contains(c));
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Returns `true` if `c` is a Unicode box-drawing or block-element glyph.
 /// These are the characters agent CLIs (notably Copilot CLI) use to draw
 /// their own input/output frames inside the PTY (`┃`, `│`, `║`, etc.).
@@ -4001,21 +4142,26 @@ pub fn run_tui(
                                     {
                                         let row = mouse.row - inner_y;
                                         let col = mouse.column - inner_x;
-                                        // Two ways to find a URL at the
-                                        // clicked cell:
+                                        // Two ways to find a URL at the clicked
+                                        // cell:
                                         //
-                                        //  1. (preferred) OSC 8 hyperlink
-                                        //     map — what the agent
-                                        //     *explicitly* marked as a
-                                        //     link via the OSC 8 escape.
-                                        //  2. (fallback) regex scan of
-                                        //     the row text for plain
-                                        //     `http(s)://...`. Required
-                                        //     because Copilot CLI prints
-                                        //     URLs as plain text without
-                                        //     OSC 8 wrapping, so without
-                                        //     this fallback Ctrl+click
-                                        //     silently does nothing.
+                                        //  1. (preferred) OSC 8 hyperlink map —
+                                        //     what the agent *explicitly* marked
+                                        //     as a link via the OSC 8 escape.
+                                        //     Works for streamed OSC 8 (e.g. a
+                                        //     plain shell). NOTE: Copilot CLI's
+                                        //     TUI-rendered hyperlinks arrive
+                                        //     mangled — Windows ConPTY strips the
+                                        //     ESC introducer when it
+                                        //     re-serialises the pane — so they
+                                        //     can't be registered here.
+                                        //  2. (fallback) [`extract_wrapped_url_at`]
+                                        //     scans the row (and its wrapped
+                                        //     continuation rows) for a plain
+                                        //     `http(s)://...`. Required because
+                                        //     agents often print URLs as plain
+                                        //     text without OSC 8; without this,
+                                        //     Ctrl+click silently does nothing.
                                         let url_to_open: Option<String> =
                                             embedded.get_screen(&pane_id).and_then(|screen_arc| {
                                                 let parser = screen_arc.lock().ok()?;
@@ -4033,11 +4179,11 @@ pub fn run_tui(
                                                 if osc8.is_some() {
                                                     return osc8;
                                                 }
-                                                let row_text = read_screen_row_text(
+                                                extract_wrapped_url_at(
                                                     parser.screen(),
                                                     screen_row,
-                                                );
-                                                extract_url_at_column(&row_text, col)
+                                                    col,
+                                                )
                                             });
                                         if let Some(url) = url_to_open
                                             && open::that(&url).is_ok()
@@ -11545,6 +11691,72 @@ mod tests {
         );
         // Click on the leading Japanese — should NOT match.
         assert!(extract_url_at_column(row, 2).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Wrapped (multi-row) plain-text URL reconstruction — the Copilot case
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wrapped_url_autowrap_rejoins_full_url() {
+        // A long URL printed as plain text auto-wraps across rows. Clicking any
+        // row must reconstruct the whole URL, not the single-row prefix.
+        let url = "https://example.com/abcdefghijklmnopqrstuvwxyz0123456789/end";
+        let mut parser = vt100::Parser::new(6, 20, 0);
+        parser.process(url.as_bytes());
+        let screen = parser.screen();
+        // Click on the first row (start).
+        assert_eq!(extract_wrapped_url_at(screen, 0, 5).as_deref(), Some(url));
+        // Click on a continuation row (row 1) — walk up + stitch forward.
+        assert_eq!(extract_wrapped_url_at(screen, 1, 3).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn wrapped_url_indented_continuation_rejoins() {
+        // Simulate an agent that hard-wraps a URL with a leading gutter/indent
+        // on continuation rows (Copilot-style). Row 0 fills to the edge.
+        let mut parser = vt100::Parser::new(6, 20, 0);
+        // 20-col row filled by the URL to the right edge, then indented halves.
+        parser.process(b"https://ex.com/aaaaa"); // 20 chars -> fills row 0
+        parser.process(b"\r\n   bbbbbccccc"); // gutter of 3 + continuation
+        let screen = parser.screen();
+        assert_eq!(
+            extract_wrapped_url_at(screen, 0, 4).as_deref(),
+            Some("https://ex.com/aaaaabbbbbccccc")
+        );
+    }
+
+    #[test]
+    fn wrapped_url_does_not_merge_two_separate_urls() {
+        // A complete URL that ends a row must not swallow a *different* URL that
+        // starts on the next row.
+        let mut parser = vt100::Parser::new(6, 40, 0);
+        parser.process(b"https://a.example/one\r\nhttps://b.example/two");
+        let screen = parser.screen();
+        assert_eq!(
+            extract_wrapped_url_at(screen, 0, 5).as_deref(),
+            Some("https://a.example/one")
+        );
+    }
+
+    #[test]
+    fn wrapped_url_single_row_unchanged() {
+        // A URL that fits on one row (followed by prose) returns just itself.
+        let mut parser = vt100::Parser::new(4, 40, 0);
+        parser.process(b"see https://example.com/x here");
+        let screen = parser.screen();
+        assert_eq!(
+            extract_wrapped_url_at(screen, 0, 8).as_deref(),
+            Some("https://example.com/x")
+        );
+    }
+
+    #[test]
+    fn wrapped_url_click_off_url_returns_none() {
+        let mut parser = vt100::Parser::new(4, 40, 0);
+        parser.process(b"just some prose with no link at all here");
+        let screen = parser.screen();
+        assert!(extract_wrapped_url_at(screen, 0, 5).is_none());
     }
 
     // ----- Dashboard pane sizing helper -----------------------------------

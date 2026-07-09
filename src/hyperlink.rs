@@ -4,6 +4,15 @@
 //! hyperlinks.  The vt100 crate does not support OSC 8, so this module
 //! intercepts the raw PTY byte stream, strips OSC 8 sequences, and records
 //! which screen rows have hyperlink URLs.
+//!
+//! Scope note (Windows): this reliably handles OSC 8 that an app *streams*
+//! (e.g. a plain shell). It does **not** recover hyperlinks emitted by a
+//! full-screen TUI that repaints with cursor addressing — notably Copilot
+//! CLI. Windows ConPTY re-serialises such a pane and drops the ESC introducer
+//! of the OSC 8 escape (so `]8;id=…;<url>` arrives as literal text), and also
+//! clips a cell at each wrap boundary. The URL is therefore neither
+//! registrable nor fully present on screen. Plain-text URLs those agents print
+//! still wrap cleanly and are recovered by `extract_wrapped_url_at` in `ui`.
 
 use std::collections::HashMap;
 
