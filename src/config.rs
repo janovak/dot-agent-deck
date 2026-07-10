@@ -81,6 +81,39 @@ pub fn socket_path() -> PathBuf {
     }
 }
 
+/// A process-unique daemon socket path for this deck instance.
+///
+/// Multiple decks must not share one daemon socket. Only the first deck can
+/// bind the shared socket; every other deck's daemon then dies with
+/// "Access is denied" and shows "No agent" for everything. Worse, all panes'
+/// `dot-agent-deck hook` invocations post to that one bound socket, and pane
+/// ids collide across decks (each deck numbers panes `1`, `2`, …), so the
+/// socket-owning deck applies other decks' events onto its own same-numbered
+/// panes — phantom "Working", swapped sessions, and (once auto-save runs)
+/// corrupted workspace files.
+///
+/// Including the PID gives each deck its own socket. `run_dashboard` publishes
+/// this via `DOT_AGENT_DECK_SOCKET`, so the in-process daemon binds it and every
+/// child pane's hook posts back to *this* deck's daemon.
+pub fn unique_socket_path() -> PathBuf {
+    let pid = std::process::id();
+
+    #[cfg(unix)]
+    {
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            return PathBuf::from(runtime_dir).join(format!("dot-agent-deck-{pid}.sock"));
+        }
+
+        PathBuf::from(format!("/tmp/dot-agent-deck-{pid}.sock"))
+    }
+
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
+        PathBuf::from(format!(r"\\.\pipe\dot-agent-deck-{user}-{pid}"))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BellConfig {
@@ -1107,6 +1140,29 @@ mod tests {
     /// Serializes tests that mutate `DOT_AGENT_DECK_WORKSPACES`. Cargo runs
     /// unit tests in parallel and they otherwise race on the shared env var.
     static WORKSPACES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn unique_socket_path_is_per_process() {
+        let p = unique_socket_path();
+        let s = p.to_string_lossy();
+        let pid = std::process::id().to_string();
+        assert!(
+            s.contains(&pid),
+            "unique socket path {s} should embed the pid {pid} so decks don't collide"
+        );
+
+        #[cfg(windows)]
+        assert!(
+            s.starts_with(r"\\.\pipe\dot-agent-deck-"),
+            "unexpected pipe name: {s}"
+        );
+
+        #[cfg(unix)]
+        assert!(
+            s.contains("dot-agent-deck-") && s.ends_with(".sock"),
+            "unexpected socket path: {s}"
+        );
+    }
 
     #[test]
     fn bell_config_defaults() {

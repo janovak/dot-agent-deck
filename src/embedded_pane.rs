@@ -280,6 +280,13 @@ impl EmbeddedPaneController {
         let pane_id = self.allocate_id();
         // Tag the spawned process so hooks can identify which pane it belongs to.
         cmd.env("DOT_AGENT_DECK_PANE_ID", &pane_id);
+        // Route this pane's `dot-agent-deck hook` invocations back to *this*
+        // deck's daemon. Each deck instance uses its own socket (set in the deck
+        // env by run_dashboard); forwarding it explicitly keeps decks isolated
+        // even if pane env inheritance is ever tightened.
+        if let Some(socket) = std::env::var_os("DOT_AGENT_DECK_SOCKET") {
+            cmd.env("DOT_AGENT_DECK_SOCKET", socket);
+        }
 
         let child = pair
             .slave

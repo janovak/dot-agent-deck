@@ -536,6 +536,26 @@ async fn run_dashboard(
         }
     }
 
+    // Give each deck instance its own daemon socket so multiple decks can run
+    // side by side without cross-wiring hook events. Without this, only the
+    // first deck binds the shared socket; every other deck's daemon dies
+    // ("Access is denied") and shows "No agent", while all hooks — whose pane
+    // ids collide across decks — land in the first deck, producing phantom
+    // "Working", swapped sessions, and corrupted workspace files on auto-save.
+    // Child panes inherit this env var (and we also forward it explicitly at
+    // spawn time), so their `dot-agent-deck hook` posts back to *this* deck's
+    // daemon. An explicit user-provided override is respected.
+    if std::env::var_os("DOT_AGENT_DECK_SOCKET").is_none() {
+        let unique = dot_agent_deck::config::unique_socket_path();
+        // SAFETY: set once here at startup, before the daemon is spawned or any
+        // pane exists, so no other thread reads DOT_AGENT_DECK_SOCKET
+        // concurrently (socket_path() below and the child panes both run after
+        // this point).
+        unsafe {
+            std::env::set_var("DOT_AGENT_DECK_SOCKET", &unique);
+        }
+    }
+
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
 
