@@ -142,7 +142,19 @@ impl AppState {
     }
 
     /// Create a placeholder session for a newly created pane so it always has a dashboard card.
-    pub fn insert_placeholder_session(&mut self, pane_id: String, cwd: Option<String>) {
+    ///
+    /// `agent_type` lets the caller seed the agent identity up front — from the
+    /// pane's launch command on creation, or from the ending session on a
+    /// `SessionEnd` restore — so the card reads e.g. "Copilot · Idle" instead
+    /// of "No agent" during the (often long) wait for the agent's first hook
+    /// event. Pass `AgentType::None` when the agent is genuinely unknown (a
+    /// plain shell pane).
+    pub fn insert_placeholder_session(
+        &mut self,
+        pane_id: String,
+        cwd: Option<String>,
+        agent_type: AgentType,
+    ) {
         let session_id = placeholder_session_id(&pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
@@ -150,7 +162,7 @@ impl AppState {
             session_id.clone(),
             SessionState {
                 session_id,
-                agent_type: AgentType::None,
+                agent_type,
                 cwd,
                 status: SessionStatus::Idle,
                 active_tool: None,
@@ -174,6 +186,30 @@ impl AppState {
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
+    }
+
+    /// Optimistically flip a live agent session on `pane_id` from Idle to
+    /// Working — called when the user submits a prompt (presses Enter) so the
+    /// card reacts instantly instead of waiting on the agent's (often laggy)
+    /// first hook event.
+    ///
+    /// No-op unless the session is a real agent (`agent_type` set — not a
+    /// placeholder/shell pane) that is currently `Idle`, so it never fights a
+    /// status the hooks have already advanced (Working/Thinking/
+    /// WaitingForInput/Pending/etc.). Returns whether it changed anything.
+    pub fn mark_pane_working_on_submit(&mut self, pane_id: &str) -> bool {
+        if let Some(s) = self
+            .sessions
+            .values_mut()
+            .find(|s| s.pane_id.as_deref() == Some(pane_id))
+            && s.agent_type != AgentType::None
+            && s.status == SessionStatus::Idle
+        {
+            s.status = SessionStatus::Working;
+            s.last_activity = Utc::now();
+            return true;
+        }
+        false
     }
 
     /// Record that the embedded PTY for `pane_id` emitted bytes from
@@ -333,18 +369,22 @@ impl AppState {
 
         if event.event_type == EventType::SessionEnd {
             // Preserve started_at for the pane so a restarted session keeps its position.
-            let pane_id_and_cwd = self.sessions.get(&event.session_id).and_then(|session| {
+            let pane_restore = self.sessions.get(&event.session_id).and_then(|session| {
                 session.pane_id.as_ref().map(|pid| {
                     self.pane_started_at.insert(pid.clone(), session.started_at);
-                    (pid.clone(), session.cwd.clone())
+                    // Carry the agent identity onto the restored placeholder so
+                    // an agent that fires SessionEnd mid-life (Copilot does this
+                    // at turn/session boundaries) shows "Copilot · Idle" rather
+                    // than reverting the card to "No agent".
+                    (pid.clone(), session.cwd.clone(), session.agent_type.clone())
                 })
             });
             self.sessions.remove(&event.session_id);
             // Restore a placeholder card so the pane remains visible on the dashboard.
-            if let Some((pane_id, cwd)) = pane_id_and_cwd
+            if let Some((pane_id, cwd, agent_type)) = pane_restore
                 && self.managed_pane_ids.contains(&pane_id)
             {
-                self.insert_placeholder_session(pane_id, cwd);
+                self.insert_placeholder_session(pane_id, cwd, agent_type);
             }
             return;
         }
@@ -580,7 +620,24 @@ impl AppState {
             // and the PTY-byte-driven `last_pty_activity` so a session
             // that is streaming response tokens (no hook events firing,
             // but bytes flowing) does not flip to Pending mid-stream.
-            let effective_last = session.last_activity.max(session.last_pty_activity);
+            //
+            // EXCEPT at an interactive prompt (`ask_user`): the agent is
+            // parked waiting on the user, but its TUI keeps repainting chrome
+            // (spinner, status-bar clock, cursor) which bumps
+            // `last_pty_activity` every tick and would perpetually reset the
+            // timer — so Pending never fires when it matters most. There, use
+            // the hook-event time only, so Pending fires promptly. During real
+            // work there is no interactive tool active, so streaming still gets
+            // the PTY-suppression above.
+            let at_interactive_prompt = session
+                .active_tool
+                .as_ref()
+                .is_some_and(|t| is_interactive_prompt_tool(&t.name));
+            let effective_last = if at_interactive_prompt {
+                session.last_activity
+            } else {
+                session.last_activity.max(session.last_pty_activity)
+            };
             let elapsed = now.signed_duration_since(effective_last);
             let elapsed_ms = elapsed.num_milliseconds();
 
@@ -1295,7 +1352,11 @@ mod tests {
     fn placeholder_session_created() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session(
+            "42".to_string(),
+            Some("/tmp".to_string()),
+            AgentType::None,
+        );
 
         assert!(state.sessions.contains_key("pane-42"));
         let session = &state.sessions["pane-42"];
@@ -1310,7 +1371,11 @@ mod tests {
     fn placeholder_transitions_to_real_session() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session(
+            "42".to_string(),
+            Some("/tmp".to_string()),
+            AgentType::None,
+        );
 
         let mut start = make_event("real-uuid-123", EventType::SessionStart);
         start.pane_id = Some("42".to_string());
@@ -1333,7 +1398,11 @@ mod tests {
     fn placeholder_restored_after_session_end() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session(
+            "42".to_string(),
+            Some("/tmp".to_string()),
+            AgentType::None,
+        );
 
         // Transition to real session (placeholder is promoted away)
         let mut start = make_event("real-uuid", EventType::SessionStart);
@@ -1344,14 +1413,20 @@ mod tests {
             AgentType::ClaudeCode
         );
 
-        // End the real session — placeholder should be restored
+        // End the real session — placeholder should be restored, and it must
+        // KEEP the agent identity (Fix A) so a mid-life SessionEnd shows
+        // "Claude · Idle" rather than reverting the card to "No agent".
         let mut end = make_event("real-uuid", EventType::SessionEnd);
         end.pane_id = Some("42".to_string());
         state.apply_event(end);
 
         assert!(state.sessions.contains_key("pane-42"));
         assert!(!state.sessions.contains_key("real-uuid"));
-        assert_eq!(state.sessions["pane-42"].agent_type, AgentType::None);
+        assert_eq!(
+            state.sessions["pane-42"].agent_type,
+            AgentType::ClaudeCode,
+            "restored placeholder must inherit the ended session's agent identity"
+        );
         assert_eq!(state.sessions["pane-42"].pane_id.as_deref(), Some("42"));
     }
 
@@ -1359,7 +1434,11 @@ mod tests {
     fn placeholder_not_restored_after_close() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session(
+            "42".to_string(),
+            Some("/tmp".to_string()),
+            AgentType::None,
+        );
 
         // Transition to real session (placeholder promoted to real UUID)
         let mut start = make_event("real-uuid", EventType::SessionStart);
@@ -1378,7 +1457,11 @@ mod tests {
     fn placeholder_excluded_from_stats() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session(
+            "42".to_string(),
+            Some("/tmp".to_string()),
+            AgentType::None,
+        );
 
         // Add a real session on a different registered pane
         state.register_pane("99".to_string());
@@ -1395,7 +1478,11 @@ mod tests {
     fn close_placeholder_session() {
         let mut state = AppState::default();
         state.register_pane("42".to_string());
-        state.insert_placeholder_session("42".to_string(), Some("/tmp".to_string()));
+        state.insert_placeholder_session(
+            "42".to_string(),
+            Some("/tmp".to_string()),
+            AgentType::None,
+        );
 
         // Simulate Ctrl+w on the placeholder
         state.sessions.remove("pane-42");
@@ -1416,7 +1503,11 @@ mod tests {
         // before the agent's first hook will be unresumable.
         let mut state = AppState::default();
         state.register_pane("3".to_string());
-        state.insert_placeholder_session("3".to_string(), Some("/repo".to_string()));
+        state.insert_placeholder_session(
+            "3".to_string(),
+            Some("/repo".to_string()),
+            AgentType::None,
+        );
 
         // Agent finally fires SessionStart with a real UUID.
         let real_uuid = "fe179f3b-5594-4ff0-9f05-94ad962db12f";
@@ -1784,6 +1875,38 @@ mod tests {
         state.sessions.get_mut("s1").unwrap().last_pty_activity =
             Utc::now() - chrono::Duration::seconds(30);
         // Two consecutive checks needed (confirmation gate).
+        assert!(
+            state
+                .apply_pending_timeout(chrono::Duration::seconds(10))
+                .is_empty()
+        );
+        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
+        assert_eq!(transitioned, vec!["s1".to_string()]);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
+    }
+
+    #[test]
+    fn pending_fires_at_ask_user_prompt_despite_fresh_pty_chrome() {
+        // Crispness regression: at an `ask_user` prompt the agent is parked
+        // waiting on the user, but its TUI keeps repainting chrome (spinner /
+        // status-bar clock) which bumps `last_pty_activity` every tick. Pending
+        // must still fire — the interactive-prompt case uses hook-event time
+        // only, ignoring the PTY chrome that would otherwise reset the timer.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        tool.tool_name = Some("ask_user".into());
+        state.apply_event(tool);
+
+        // The prompt appeared 30s ago (stale hook activity)...
+        state.sessions.get_mut("s1").unwrap().last_activity =
+            Utc::now() - chrono::Duration::seconds(30);
+        // ...but the TUI just repainted 200ms ago (fresh PTY chrome). Before
+        // the fix, effective_last = max(...) would be fresh and suppress Pending.
+        state.sessions.get_mut("s1").unwrap().last_pty_activity =
+            Utc::now() - chrono::Duration::milliseconds(200);
+
         assert!(
             state
                 .apply_pending_timeout(chrono::Duration::seconds(10))
@@ -2270,6 +2393,54 @@ mod tests {
         let mut ev = make_event(session_id, event_type);
         ev.pane_id = Some(pane_id.to_string());
         ev
+    }
+
+    #[test]
+    fn mark_working_on_submit_flips_idle_agent() {
+        // The user pressing Enter on a focused agent pane should make the card
+        // react instantly rather than waiting on the agent's first hook event.
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Idle);
+        assert_ne!(state.sessions["s1"].agent_type, AgentType::None);
+
+        assert!(state.mark_pane_working_on_submit("p1"));
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn mark_working_on_submit_ignores_placeholder_nonidle_and_unknown() {
+        let mut state = AppState::default();
+        state.register_pane("p1".into());
+
+        // Placeholder with unknown agent (a plain shell) must NOT be flipped.
+        state.insert_placeholder_session("p1".into(), None, AgentType::None);
+        assert!(!state.mark_pane_working_on_submit("p1"));
+        assert_eq!(state.sessions["pane-p1"].status, SessionStatus::Idle);
+
+        // A live agent already past Idle must not be clobbered.
+        state.insert_placeholder_session("p2".into(), None, AgentType::CopilotCli);
+        state.sessions.get_mut("pane-p2").unwrap().status = SessionStatus::WaitingForInput;
+        assert!(!state.mark_pane_working_on_submit("p2"));
+        assert_eq!(
+            state.sessions["pane-p2"].status,
+            SessionStatus::WaitingForInput
+        );
+
+        // Unknown pane — no-op.
+        assert!(!state.mark_pane_working_on_submit("nope"));
+    }
+
+    #[test]
+    fn mark_working_on_submit_flips_agent_placeholder() {
+        // A command-detected placeholder (Fix A: "Copilot · Idle" before any
+        // hook) should also flip to Working on submit.
+        let mut state = AppState::default();
+        state.register_pane("p3".into());
+        state.insert_placeholder_session("p3".into(), None, AgentType::CopilotCli);
+        assert!(state.mark_pane_working_on_submit("p3"));
+        assert_eq!(state.sessions["pane-p3"].status, SessionStatus::Working);
     }
 
     #[test]
