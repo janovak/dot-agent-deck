@@ -1294,7 +1294,7 @@ fn dispatch_delegate_events(
                     st.insert_placeholder_session(
                         new_pane_id.clone(),
                         Some(cwd.clone()),
-                        agent_type_from_command(&role.command),
+                        AgentType::None,
                     );
                 }
 
@@ -2023,63 +2023,6 @@ fn command_indicates_bracketed_paste_agent(command: &str) -> bool {
         .or_else(|| basename.strip_suffix(".ps1"))
         .unwrap_or(basename.as_str());
     matches!(stem, "copilot" | "claude" | "opencode")
-}
-
-/// Detect the agent CLI from a pane's launch command, so a freshly created
-/// (or `SessionEnd`-restored) pane's placeholder card can show the agent
-/// immediately instead of "No agent" while it waits for the agent's first
-/// hook event.
-///
-/// Scans every whitespace token (not just the first) so a wrapped invocation
-/// like `agency copilot --allow-all` still resolves to `CopilotCli`. The first
-/// token additionally respects a leading quote so a quoted path with spaces
-/// (`"C:\Program Files\copilot.cmd"`) matches. Returns `AgentType::None` when
-/// no token's basename stem is a known agent (e.g. a plain shell pane).
-fn agent_type_from_command(command: &str) -> AgentType {
-    fn stem_of(token: &str) -> String {
-        let basename = std::path::Path::new(token)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(token)
-            .to_ascii_lowercase();
-        basename
-            .strip_suffix(".exe")
-            .or_else(|| basename.strip_suffix(".cmd"))
-            .or_else(|| basename.strip_suffix(".bat"))
-            .or_else(|| basename.strip_suffix(".ps1"))
-            .unwrap_or(basename.as_str())
-            .to_string()
-    }
-    fn classify(stem: &str) -> AgentType {
-        match stem {
-            "copilot" => AgentType::CopilotCli,
-            "claude" => AgentType::ClaudeCode,
-            "opencode" => AgentType::OpenCode,
-            _ => AgentType::None,
-        }
-    }
-
-    let trimmed = command.trim_start();
-    // First token, honouring a leading quote around a spaced path.
-    let first_token = if let Some(rest) = trimmed.strip_prefix('"') {
-        rest.split('"').next().unwrap_or("")
-    } else if let Some(rest) = trimmed.strip_prefix('\'') {
-        rest.split('\'').next().unwrap_or("")
-    } else {
-        trimmed.split_whitespace().next().unwrap_or("")
-    };
-    let first = classify(&stem_of(first_token));
-    if first != AgentType::None {
-        return first;
-    }
-    // Otherwise scan the remaining tokens (wrapper case).
-    for token in trimmed.split_whitespace() {
-        let a = classify(&stem_of(token));
-        if a != AgentType::None {
-            return a;
-        }
-    }
-    AgentType::None
 }
 
 /// Strip trailing `\r`/`\n` from a pasted payload so the paste never
@@ -3385,7 +3328,7 @@ pub fn run_tui(
                         st.insert_placeholder_session(
                             new_id.clone(),
                             Some(saved_pane.dir.clone()),
-                            cmd.map(agent_type_from_command).unwrap_or(AgentType::None),
+                            AgentType::None,
                         );
                     }
                     if !saved_pane.name.is_empty() {
@@ -3510,8 +3453,7 @@ pub fn run_tui(
                                         st.insert_placeholder_session(
                                             fb_id.clone(),
                                             Some(saved_pane.dir.clone()),
-                                            cmd.map(agent_type_from_command)
-                                                .unwrap_or(AgentType::None),
+                                            AgentType::None,
                                         );
                                     }
                                     if !saved_pane.name.is_empty() {
@@ -3570,7 +3512,7 @@ pub fn run_tui(
                                 st.insert_placeholder_session(
                                     fb_id.clone(),
                                     Some(saved_pane.dir.clone()),
-                                    cmd.map(agent_type_from_command).unwrap_or(AgentType::None),
+                                    AgentType::None,
                                 );
                             }
                             if !saved_pane.name.is_empty() {
@@ -5067,17 +5009,12 @@ pub fn run_tui(
                                 Ok((_tab_idx, role_pane_ids)) => {
                                     {
                                         let mut st = state.blocking_write();
-                                        for (i, id) in role_pane_ids.iter().enumerate() {
+                                        for id in &role_pane_ids {
                                             st.register_pane(id.clone());
-                                            let agent = orch_config
-                                                .roles
-                                                .get(i)
-                                                .map(|r| agent_type_from_command(&r.command))
-                                                .unwrap_or(AgentType::None);
                                             st.insert_placeholder_session(
                                                 id.clone(),
                                                 Some(dir_str.clone()),
-                                                agent,
+                                                AgentType::None,
                                             );
                                         }
                                         // Register pane-to-role and pane-to-cwd mappings for work-done resolution.
@@ -5193,8 +5130,7 @@ pub fn run_tui(
                                         st.insert_placeholder_session(
                                             new_id.clone(),
                                             Some(dir_str.clone()),
-                                            cmd.map(agent_type_from_command)
-                                                .unwrap_or(AgentType::None),
+                                            AgentType::None,
                                         );
                                     }
                                     if !req.name.is_empty() {
@@ -11463,61 +11399,6 @@ mod tests {
         ));
         assert!(!command_indicates_bracketed_paste_agent(""));
         assert!(!command_indicates_bracketed_paste_agent("copilot-other"));
-    }
-
-    #[test]
-    fn agent_type_from_command_detects_known_agents() {
-        use crate::event::AgentType;
-        assert_eq!(agent_type_from_command("copilot"), AgentType::CopilotCli);
-        assert_eq!(
-            agent_type_from_command("copilot --resume abc"),
-            AgentType::CopilotCli
-        );
-        assert_eq!(
-            agent_type_from_command("Copilot.EXE"),
-            AgentType::CopilotCli
-        );
-        assert_eq!(agent_type_from_command("claude"), AgentType::ClaudeCode);
-        assert_eq!(agent_type_from_command("opencode"), AgentType::OpenCode);
-    }
-
-    #[test]
-    fn agent_type_from_command_sees_through_wrapper() {
-        use crate::event::AgentType;
-        // The `agency copilot --allow-all` wrapper: the agent is the *second*
-        // token, not the first.
-        assert_eq!(
-            agent_type_from_command("agency copilot --allow-all"),
-            AgentType::CopilotCli
-        );
-        assert_eq!(
-            agent_type_from_command("agency copilot --allow-all --resume xyz"),
-            AgentType::CopilotCli
-        );
-    }
-
-    #[test]
-    fn agent_type_from_command_handles_quoted_path() {
-        use crate::event::AgentType;
-        assert_eq!(
-            agent_type_from_command("\"C:\\Program Files\\copilot.cmd\" --resume foo"),
-            AgentType::CopilotCli
-        );
-    }
-
-    #[test]
-    fn agent_type_from_command_is_none_for_shell_or_unknown() {
-        use crate::event::AgentType;
-        assert_eq!(agent_type_from_command("cmd.exe"), AgentType::None);
-        assert_eq!(agent_type_from_command("pwsh"), AgentType::None);
-        assert_eq!(agent_type_from_command("bash -l"), AgentType::None);
-        assert_eq!(agent_type_from_command(""), AgentType::None);
-        // A resume id that merely contains "copilot" must not match (exact
-        // basename stem only).
-        assert_eq!(
-            agent_type_from_command("cmd --flag copilot-session-123"),
-            AgentType::None
-        );
     }
 
     // -----------------------------------------------------------------------
