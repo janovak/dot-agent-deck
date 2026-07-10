@@ -188,30 +188,6 @@ impl AppState {
         self.orchestrator_pane_ids.remove(pane_id);
     }
 
-    /// Optimistically flip a live agent session on `pane_id` from Idle to
-    /// Working — called when the user submits a prompt (presses Enter) so the
-    /// card reacts instantly instead of waiting on the agent's (often laggy)
-    /// first hook event.
-    ///
-    /// No-op unless the session is a real agent (`agent_type` set — not a
-    /// placeholder/shell pane) that is currently `Idle`, so it never fights a
-    /// status the hooks have already advanced (Working/Thinking/
-    /// WaitingForInput/Pending/etc.). Returns whether it changed anything.
-    pub fn mark_pane_working_on_submit(&mut self, pane_id: &str) -> bool {
-        if let Some(s) = self
-            .sessions
-            .values_mut()
-            .find(|s| s.pane_id.as_deref() == Some(pane_id))
-            && s.agent_type != AgentType::None
-            && s.status == SessionStatus::Idle
-        {
-            s.status = SessionStatus::Working;
-            s.last_activity = Utc::now();
-            return true;
-        }
-        false
-    }
-
     /// Record that the embedded PTY for `pane_id` emitted bytes from
     /// the agent at `at`. Updates `last_pty_activity` on every session
     /// bound to that pane (typically one) when `at` is more recent than
@@ -453,7 +429,21 @@ impl AppState {
             }
             EventType::ToolStart => {
                 if session.status != SessionStatus::WaitingForInput {
-                    session.status = SessionStatus::Working;
+                    // An interactive-prompt tool (Copilot's `ask_user`) is,
+                    // by definition, blocking on the user — so go straight to
+                    // Pending instead of Working. There is no reason to wait
+                    // out the `apply_pending_timeout` grace period for a case
+                    // we can detect deterministically: the moment the prompt
+                    // appears, the card should signal "needs you".
+                    let is_prompt = event
+                        .tool_name
+                        .as_deref()
+                        .is_some_and(is_interactive_prompt_tool);
+                    session.status = if is_prompt {
+                        SessionStatus::Pending
+                    } else {
+                        SessionStatus::Working
+                    };
                 }
                 session.active_tool = Some(ActiveTool {
                     name: event.tool_name.clone().unwrap_or_default(),
@@ -463,7 +453,13 @@ impl AppState {
             EventType::ToolEnd => {
                 session.active_tool = None;
                 session.tool_count += 1;
-                if session.status == SessionStatus::WaitingForInput {
+                // The prompt/permission was answered: the agent is processing
+                // again, so clear the attention state to Thinking rather than
+                // lingering on WaitingForInput / Pending until the next hook.
+                if matches!(
+                    session.status,
+                    SessionStatus::WaitingForInput | SessionStatus::Pending
+                ) {
                     session.status = SessionStatus::Thinking;
                 }
             }
@@ -620,24 +616,7 @@ impl AppState {
             // and the PTY-byte-driven `last_pty_activity` so a session
             // that is streaming response tokens (no hook events firing,
             // but bytes flowing) does not flip to Pending mid-stream.
-            //
-            // EXCEPT at an interactive prompt (`ask_user`): the agent is
-            // parked waiting on the user, but its TUI keeps repainting chrome
-            // (spinner, status-bar clock, cursor) which bumps
-            // `last_pty_activity` every tick and would perpetually reset the
-            // timer — so Pending never fires when it matters most. There, use
-            // the hook-event time only, so Pending fires promptly. During real
-            // work there is no interactive tool active, so streaming still gets
-            // the PTY-suppression above.
-            let at_interactive_prompt = session
-                .active_tool
-                .as_ref()
-                .is_some_and(|t| is_interactive_prompt_tool(&t.name));
-            let effective_last = if at_interactive_prompt {
-                session.last_activity
-            } else {
-                session.last_activity.max(session.last_pty_activity)
-            };
+            let effective_last = session.last_activity.max(session.last_pty_activity);
             let elapsed = now.signed_duration_since(effective_last);
             let elapsed_ms = elapsed.num_milliseconds();
 
@@ -1852,69 +1831,51 @@ mod tests {
     }
 
     #[test]
-    fn pending_timeout_fires_when_active_tool_is_ask_user() {
-        // Copilot CLI's clarifying-question pattern presents as an active
-        // tool named `ask_user` that blocks until the user picks an
-        // option. The Pending heuristic must treat this case as
-        // eligible — not skip on `active_tool.is_some()` — because
-        // the user's attention is exactly what the tool is waiting for.
-        // Confirmed in production logs: status=Working active_tool=ask_user
-        // for 2+ minutes with no other events.
+    fn ask_user_tool_goes_pending_immediately() {
+        // Copilot CLI's clarifying-question pattern presents as an active tool
+        // named `ask_user` that blocks until the user picks an option. Because
+        // that *definitionally* means "waiting on the user", the card goes
+        // straight to Pending the moment the prompt appears — no
+        // apply_pending_timeout grace period, and independent of any TUI
+        // repaint chrome bumping last_pty_activity.
         let mut state = AppState::default();
         state.register_pane("p1".into());
         state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
         let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
         tool.tool_name = Some("ask_user".into());
         state.apply_event(tool);
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
+
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
         assert!(state.sessions["s1"].active_tool.is_some());
 
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        // Two consecutive checks needed (confirmation gate).
-        assert!(
-            state
-                .apply_pending_timeout(chrono::Duration::seconds(10))
-                .is_empty()
-        );
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert_eq!(transitioned, vec!["s1".to_string()]);
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
+        // A normal (non-interactive) tool still goes Working, not Pending.
+        // (Separate pane so the same-pane re-key logic doesn't merge it.)
+        state.register_pane("p2".into());
+        state.apply_event(make_event_with_pane("s2", EventType::SessionStart, "p2"));
+        let mut bash = make_event_with_pane("s2", EventType::ToolStart, "p2");
+        bash.tool_name = Some("Bash".into());
+        state.apply_event(bash);
+        assert_eq!(state.sessions["s2"].status, SessionStatus::Working);
     }
 
     #[test]
-    fn pending_fires_at_ask_user_prompt_despite_fresh_pty_chrome() {
-        // Crispness regression: at an `ask_user` prompt the agent is parked
-        // waiting on the user, but its TUI keeps repainting chrome (spinner /
-        // status-bar clock) which bumps `last_pty_activity` every tick. Pending
-        // must still fire — the interactive-prompt case uses hook-event time
-        // only, ignoring the PTY chrome that would otherwise reset the timer.
+    fn ask_user_answered_clears_pending_to_thinking() {
+        // Once the user answers, the agent is processing again — the ToolEnd
+        // must clear the Pending attention state to Thinking rather than
+        // lingering on "needs you" until the next (possibly laggy) hook.
         let mut state = AppState::default();
         state.register_pane("p1".into());
         state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
         let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
         tool.tool_name = Some("ask_user".into());
         state.apply_event(tool);
-
-        // The prompt appeared 30s ago (stale hook activity)...
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        // ...but the TUI just repainted 200ms ago (fresh PTY chrome). Before
-        // the fix, effective_last = max(...) would be fresh and suppress Pending.
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::milliseconds(200);
-
-        assert!(
-            state
-                .apply_pending_timeout(chrono::Duration::seconds(10))
-                .is_empty()
-        );
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert_eq!(transitioned, vec!["s1".to_string()]);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
+
+        let mut end = make_event_with_pane("s1", EventType::ToolEnd, "p1");
+        end.tool_name = Some("ask_user".into());
+        state.apply_event(end);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Thinking);
+        assert!(state.sessions["s1"].active_tool.is_none());
     }
 
     #[test]
@@ -2393,54 +2354,6 @@ mod tests {
         let mut ev = make_event(session_id, event_type);
         ev.pane_id = Some(pane_id.to_string());
         ev
-    }
-
-    #[test]
-    fn mark_working_on_submit_flips_idle_agent() {
-        // The user pressing Enter on a focused agent pane should make the card
-        // react instantly rather than waiting on the agent's first hook event.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Idle);
-        assert_ne!(state.sessions["s1"].agent_type, AgentType::None);
-
-        assert!(state.mark_pane_working_on_submit("p1"));
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-    }
-
-    #[test]
-    fn mark_working_on_submit_ignores_placeholder_nonidle_and_unknown() {
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-
-        // Placeholder with unknown agent (a plain shell) must NOT be flipped.
-        state.insert_placeholder_session("p1".into(), None, AgentType::None);
-        assert!(!state.mark_pane_working_on_submit("p1"));
-        assert_eq!(state.sessions["pane-p1"].status, SessionStatus::Idle);
-
-        // A live agent already past Idle must not be clobbered.
-        state.insert_placeholder_session("p2".into(), None, AgentType::CopilotCli);
-        state.sessions.get_mut("pane-p2").unwrap().status = SessionStatus::WaitingForInput;
-        assert!(!state.mark_pane_working_on_submit("p2"));
-        assert_eq!(
-            state.sessions["pane-p2"].status,
-            SessionStatus::WaitingForInput
-        );
-
-        // Unknown pane — no-op.
-        assert!(!state.mark_pane_working_on_submit("nope"));
-    }
-
-    #[test]
-    fn mark_working_on_submit_flips_agent_placeholder() {
-        // A command-detected placeholder (Fix A: "Copilot · Idle" before any
-        // hook) should also flip to Working on submit.
-        let mut state = AppState::default();
-        state.register_pane("p3".into());
-        state.insert_placeholder_session("p3".into(), None, AgentType::CopilotCli);
-        assert!(state.mark_pane_working_on_submit("p3"));
-        assert_eq!(state.sessions["pane-p3"].status, SessionStatus::Working);
     }
 
     #[test]

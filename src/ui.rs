@@ -5398,17 +5398,6 @@ pub fn run_tui(
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                             && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab);
                         if burstable {
-                            // Optimistic Working: a *standalone* Enter (nothing
-                            // else accumulated this drain) is the user submitting
-                            // a prompt. Flip a live agent session Idle -> Working
-                            // immediately, instead of waiting on the agent's
-                            // (often laggy) first hook event. Skipped when a burst
-                            // is already building (a paste / fast-typed flood,
-                            // `burst_keys > 0`), which strips its trailing newline
-                            // and does not submit.
-                            if matches!(key.code, KeyCode::Enter) && pane_input_burst_keys == 0 {
-                                state.blocking_write().mark_pane_working_on_submit(&pane_id);
-                            }
                             pane_input_burst.extend_from_slice(&bytes);
                             pane_input_burst_keys = pane_input_burst_keys.saturating_add(1);
                         } else {
