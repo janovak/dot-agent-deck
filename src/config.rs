@@ -797,10 +797,13 @@ fn is_simple_agent_invocation(command: &str, agent: &AgentType) -> bool {
 ///   - `base` isn't a simple agent invocation (see
 ///     `is_simple_agent_invocation` — quoted args, unknown wrappers,
 ///     positional subcommands, etc.);
-///   - `session_id` contains characters outside `[A-Za-z0-9_-]`.
-///     Real Copilot/Claude ids are UUID-shaped, so anything else
-///     is treated as corrupt and skipped rather than fed into the
-///     PTY where it would be interpreted by the user's shell.
+///   - `session_id` isn't a canonical UUID. Real Copilot/Claude ids
+///     are UUID-shaped; anything else — a value with characters
+///     outside `[A-Za-z0-9_-]`, or a charset-clean non-session
+///     identifier that leaked into the `sessionId` hook field (a
+///     subagent/MCP id or name) — is treated as unresumable and
+///     skipped rather than fed to the agent (which would reject it
+///     with "No session or name matched '…'") or the shell.
 ///
 /// `--resume <id>` is always appended at the *end* of the stripped
 /// command, after any wrapper / flag tokens — Copilot CLI and Claude
@@ -832,6 +835,15 @@ pub fn build_resume_command(
     if is_tool_call_id(sid) {
         return base.to_string();
     }
+    // Only a canonical UUID is a resumable Copilot/Claude session. A non-UUID
+    // value here is a non-session identifier that leaked into the `sessionId`
+    // hook field — a subagent/MCP id such as
+    // `sidekick-github-context-memory-<ts>`, or a stale name — which the agent
+    // rejects with "No session or name matched '…'". Fall back to a fresh
+    // session so the pane opens cleanly instead of erroring.
+    if !looks_like_session_id(sid) {
+        return base.to_string();
+    }
     let stripped = strip_resume_flag(base);
     let trimmed = stripped.trim();
     format!("{trimmed} --resume {sid}")
@@ -849,6 +861,24 @@ fn is_safe_session_id(sid: &str) -> bool {
         && sid
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Whether `sid` has the canonical UUID shape (`8-4-4-4-12` hex) that real
+/// Copilot CLI and Claude Code session ids use.
+///
+/// `is_safe_session_id` only rejects shell-unsafe *characters* — it accepts any
+/// `[A-Za-z0-9_-]` string, including a non-session identifier that a subagent or
+/// MCP hook event leaked into the `sessionId` field (e.g.
+/// `sidekick-github-context-memory-1783703040081`). Requiring the UUID shape
+/// before splicing `--resume <id>` keeps those out; the agent would otherwise
+/// reject them with "No session or name matched '…'".
+pub fn looks_like_session_id(sid: &str) -> bool {
+    let bytes = sid.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, &c)| match i {
+            8 | 13 | 18 | 23 => c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
 }
 
 const STAR_PROMPT_INTERVAL: u64 = 10;
@@ -2238,25 +2268,28 @@ timeout_secs = 600
 
     #[test]
     fn build_resume_command_happy_path_copilot() {
-        let out = build_resume_command("copilot", Some("abc-123"), Some(&AgentType::CopilotCli));
-        assert_eq!(out, "copilot --resume abc-123");
+        let sid = "7eddc990-ea49-4c5d-9e6a-f0b718aa39aa";
+        let out = build_resume_command("copilot", Some(sid), Some(&AgentType::CopilotCli));
+        assert_eq!(out, format!("copilot --resume {sid}"));
     }
 
     #[test]
     fn build_resume_command_happy_path_claude() {
-        let out = build_resume_command("claude", Some("def-456"), Some(&AgentType::ClaudeCode));
-        assert_eq!(out, "claude --resume def-456");
+        let sid = "faa64853-a973-4e84-a4da-84844b63a9cf";
+        let out = build_resume_command("claude", Some(sid), Some(&AgentType::ClaudeCode));
+        assert_eq!(out, format!("claude --resume {sid}"));
     }
 
     #[test]
     fn build_resume_command_round_trip_is_idempotent() {
         // Restore writes `copilot --resume X`; on the next save+restore
         // we must end up with the new id rather than two flags.
-        let first =
-            build_resume_command("copilot", Some("session-1"), Some(&AgentType::CopilotCli));
-        assert_eq!(first, "copilot --resume session-1");
-        let second = build_resume_command(&first, Some("session-2"), Some(&AgentType::CopilotCli));
-        assert_eq!(second, "copilot --resume session-2");
+        let id1 = "7eddc990-ea49-4c5d-9e6a-f0b718aa39aa";
+        let id2 = "faa64853-a973-4e84-a4da-84844b63a9cf";
+        let first = build_resume_command("copilot", Some(id1), Some(&AgentType::CopilotCli));
+        assert_eq!(first, format!("copilot --resume {id1}"));
+        let second = build_resume_command(&first, Some(id2), Some(&AgentType::CopilotCli));
+        assert_eq!(second, format!("copilot --resume {id2}"));
     }
 
     #[test]
@@ -2264,21 +2297,22 @@ timeout_secs = 600
         // Boolean flags after the agent stay intact; `--resume` is
         // appended at the end. (Previously this passed through
         // unchanged — we now resume in this shape too.)
+        let sid = "7eddc990-ea49-4c5d-9e6a-f0b718aa39aa";
         assert_eq!(
             build_resume_command(
                 "copilot --allow-all",
-                Some("abc"),
+                Some(sid),
                 Some(&AgentType::CopilotCli)
             ),
-            "copilot --allow-all --resume abc"
+            format!("copilot --allow-all --resume {sid}")
         );
         assert_eq!(
             build_resume_command(
                 "copilot --model=gpt-5",
-                Some("abc"),
+                Some(sid),
                 Some(&AgentType::CopilotCli)
             ),
-            "copilot --model=gpt-5 --resume abc"
+            format!("copilot --model=gpt-5 --resume {sid}")
         );
     }
 
@@ -2308,8 +2342,12 @@ timeout_secs = 600
             "agency copilot --allow-all --resume faa64853-a973-4e84-a4da-84844b63a9cf"
         );
         assert_eq!(
-            build_resume_command("npx claude", Some("def-456"), Some(&AgentType::ClaudeCode)),
-            "npx claude --resume def-456"
+            build_resume_command(
+                "npx claude",
+                Some("0dc83c83-3bd6-4fb8-83c1-c8d25d820f86"),
+                Some(&AgentType::ClaudeCode)
+            ),
+            "npx claude --resume 0dc83c83-3bd6-4fb8-83c1-c8d25d820f86"
         );
     }
 
@@ -2318,14 +2356,16 @@ timeout_secs = 600
         // Restore writes `agency copilot --allow-all --resume X`; on
         // the next save+restore we must end up with the new id rather
         // than two flags appended.
+        let id1 = "7eddc990-ea49-4c5d-9e6a-f0b718aa39aa";
+        let id2 = "faa64853-a973-4e84-a4da-84844b63a9cf";
         let first = build_resume_command(
             "agency copilot --allow-all",
-            Some("session-1"),
+            Some(id1),
             Some(&AgentType::CopilotCli),
         );
-        assert_eq!(first, "agency copilot --allow-all --resume session-1");
-        let second = build_resume_command(&first, Some("session-2"), Some(&AgentType::CopilotCli));
-        assert_eq!(second, "agency copilot --allow-all --resume session-2");
+        assert_eq!(first, format!("agency copilot --allow-all --resume {id1}"));
+        let second = build_resume_command(&first, Some(id2), Some(&AgentType::CopilotCli));
+        assert_eq!(second, format!("agency copilot --allow-all --resume {id2}"));
     }
 
     #[test]
@@ -2389,9 +2429,10 @@ timeout_secs = 600
             );
         }
         // And the happy UUID-shaped case still works.
+        let uuid = "7eddc990-ea49-4c5d-9e6a-f0b718aa39aa";
         assert_eq!(
-            build_resume_command(cmd, Some("abc-123_DEF-456"), Some(&AgentType::CopilotCli)),
-            "copilot --resume abc-123_DEF-456"
+            build_resume_command(cmd, Some(uuid), Some(&AgentType::CopilotCli)),
+            format!("copilot --resume {uuid}")
         );
     }
 
@@ -2413,6 +2454,57 @@ timeout_secs = 600
                 "must refuse to resume a tool-call id: {sid:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_resume_command_rejects_non_uuid_leaked_ids() {
+        // Subagent/MCP hook events can leak a non-session identifier into
+        // `sessionId` that is charset-clean but not a resumable session — a real
+        // case is `sidekick-github-context-memory-<ts>`. Restore must fall back
+        // to a fresh session rather than emit a `--resume` the agent rejects
+        // with "No session or name matched '…'".
+        let cmd = "agency copilot --allow-all";
+        for sid in [
+            "sidekick-github-context-memory-1783703040081",
+            "my-named-session",
+            "1783703040081",
+            "7eddc990ea494c5d9e6af0b718aa39aa", // UUID without hyphens
+            "7eddc990-ea49-4c5d-9e6a-f0b718aa39a", // one char too short
+            "7eddc990-ea49-4c5d-9e6a-f0b718aa39aaa", // one char too long
+        ] {
+            assert_eq!(
+                build_resume_command(cmd, Some(sid), Some(&AgentType::CopilotCli)),
+                cmd,
+                "must refuse to resume a non-uuid id: {sid:?}"
+            );
+        }
+        // A canonical UUID still resumes.
+        let uuid = "7eddc990-ea49-4c5d-9e6a-f0b718aa39aa";
+        assert_eq!(
+            build_resume_command(cmd, Some(uuid), Some(&AgentType::CopilotCli)),
+            format!("{cmd} --resume {uuid}")
+        );
+    }
+
+    #[test]
+    fn looks_like_session_id_accepts_only_canonical_uuids() {
+        assert!(looks_like_session_id(
+            "7eddc990-ea49-4c5d-9e6a-f0b718aa39aa"
+        ));
+        // Hex is case-insensitive.
+        assert!(looks_like_session_id(
+            "FAA64853-A973-4E84-A4DA-84844B63A9CF"
+        ));
+        assert!(!looks_like_session_id(""));
+        assert!(!looks_like_session_id(
+            "sidekick-github-context-memory-1783703040081"
+        ));
+        assert!(!looks_like_session_id("7eddc990ea494c5d9e6af0b718aa39aa")); // no hyphens
+        assert!(!looks_like_session_id("toolu_018dZ3HtuEnKRQfjGwaGZEFc"));
+        // Right length and hyphen layout, but a non-hex char.
+        assert!(!looks_like_session_id(
+            "zeddc990-ea49-4c5d-9e6a-f0b718aa39aa"
+        ));
     }
 
     #[test]

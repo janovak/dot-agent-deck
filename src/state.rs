@@ -287,18 +287,23 @@ impl AppState {
                 // field, not the key.)
                 //
                 // EXCEPTION: subagent hook events run in the parent's
-                // pane but carry the spawning *tool-call id*
-                // (`toolu_…`/`call_…`) as their sessionId, not a
-                // resumable session GUID. They must still update the
-                // parent card (status, subagent counters) via the event
-                // rewrite below, but must NOT overwrite the canonical
-                // `session_id` — otherwise workspace/bookmark resume
-                // saves `copilot --resume toolu_…`, which the agent
-                // rejects with "No session or name matched '…'".
-                if !is_tool_call_id(&event.session_id)
-                    && let Some(s) = self.sessions.get_mut(&existing_id)
-                {
-                    s.session_id = event.session_id.clone();
+                // pane but carry a non-session identifier as their
+                // sessionId, not the parent's resumable GUID. Copilot
+                // subagents emit tool-call ids (`toolu_…`/`call_…`);
+                // other subagent/MCP integrations emit names such as
+                // `sidekick-github-context-memory-<ts>`. Such events must
+                // still update the parent card (status, subagent counters)
+                // via the rewrite below, but must NOT downgrade the
+                // canonical `session_id` from a real UUID to a
+                // non-resumable id — otherwise workspace/bookmark resume
+                // saves `copilot --resume <that>`, which the agent rejects
+                // with "No session or name matched '…'".
+                if let Some(s) = self.sessions.get_mut(&existing_id) {
+                    let downgrades_real_session = is_resumable_session_id(&s.session_id)
+                        && !is_resumable_session_id(&event.session_id);
+                    if !downgrades_real_session {
+                        s.session_id = event.session_id.clone();
+                    }
                 }
                 let old_id = std::mem::replace(&mut event.session_id, existing_id);
                 if old_id != event.session_id {
@@ -567,6 +572,20 @@ const PLACEHOLDER_SESSION_ID_PREFIX: &str = "pane-";
 /// UUID-shaped and never collide with these prefixes.
 pub fn is_tool_call_id(id: &str) -> bool {
     id.starts_with("toolu_") || id.starts_with("call_")
+}
+
+/// Whether `id` is a real, resumable agent session id — a canonical UUID, as
+/// used by Copilot CLI and Claude Code.
+///
+/// Placeholder ids (`pane-<n>`), tool-call ids (`toolu_`/`call_`), and other
+/// subagent/MCP identifiers that leak into the `sessionId` hook field (e.g.
+/// `sidekick-github-context-memory-<ts>`) are NOT resumable, so they must never
+/// downgrade a pane's canonical `session_id` (its resume pointer). Note this is
+/// a *downgrade* guard: agents whose ids aren't UUIDs (e.g. OpenCode) still key
+/// their own cards, because we only refuse to overwrite an id that already IS a
+/// real UUID.
+fn is_resumable_session_id(id: &str) -> bool {
+    crate::config::looks_like_session_id(id)
 }
 
 #[cfg(test)]
@@ -1355,6 +1374,48 @@ mod tests {
                 "canonical session_id must NOT be overwritten by a tool-call id"
             );
         }
+    }
+
+    #[test]
+    fn subagent_named_id_does_not_corrupt_canonical_session_id() {
+        // Newer subagent/MCP integrations emit a `sessionId` shaped like a
+        // name plus a timestamp (e.g. `sidekick-github-context-memory-<ts>`)
+        // rather than a `toolu_`/`call_` tool-call id. Like tool-call ids, such
+        // an event must not overwrite the parent's canonical (resumable)
+        // session UUID — otherwise workspace/bookmark resume saves
+        // `copilot --resume <that>` and the agent rejects it with
+        // "No session or name matched '…'".
+        let mut state = AppState::default();
+        state.register_pane("7".to_string());
+
+        let real_uuid = "0dc83c83-3bd6-4fb8-83c1-c8d25d820f86";
+        let mut start = make_event(real_uuid, EventType::SessionStart);
+        start.agent_type = AgentType::CopilotCli;
+        start.pane_id = Some("7".to_string());
+        state.apply_event(start);
+        assert!(state.sessions.contains_key(real_uuid));
+
+        // A subagent event arrives on the SAME pane carrying a leaked,
+        // non-UUID identifier as its session id.
+        let leaked_id = "sidekick-github-context-memory-1783705834192";
+        let mut leak = make_event(leaked_id, EventType::ToolStart);
+        leak.agent_type = AgentType::CopilotCli;
+        leak.pane_id = Some("7".to_string());
+        leak.tool_name = Some("Bash".to_string());
+        state.apply_event(leak);
+
+        assert!(
+            state.sessions.contains_key(real_uuid),
+            "parent card must remain keyed by the real UUID"
+        );
+        assert!(
+            !state.sessions.contains_key(leaked_id),
+            "no spurious card should be created under the leaked id"
+        );
+        assert_eq!(
+            state.sessions[real_uuid].session_id, real_uuid,
+            "canonical session_id must NOT be overwritten by a leaked subagent id"
+        );
     }
 
     #[test]

@@ -2948,11 +2948,16 @@ fn handle_bookmark_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                 // `build_resume_command` strips any stale `--resume` and
                 // appends `--resume <id>`. If the captured command isn't a
                 // simple agent invocation it returns the base unchanged (no
-                // `--resume`) — which would start a *fresh* session, so we
-                // detect the missing flag and fall back to a bare resume.
-                // Legacy bookmarks (no captured command/agent) likewise use
-                // the historical bare `copilot --resume <id>`.
-                let bare_resume = format!("copilot --resume {}", b.session_id);
+                // `--resume`) — we then fall back to the historical bare
+                // `copilot --resume <id>`.
+                //
+                // But a bookmark whose session_id isn't a real (UUID-shaped)
+                // session — e.g. a subagent/MCP identifier that leaked into
+                // `sessionId` — can't be resumed at all; `copilot --resume
+                // <that>` fails with "No session or name matched '…'". For
+                // those we open fresh (keeping the captured command shape when
+                // we have one) rather than emit a resume the agent rejects.
+                let resumable = crate::config::looks_like_session_id(&b.session_id);
                 let command = match (b.command.as_deref(), b.agent_type.as_ref()) {
                     (Some(base), Some(agent)) => {
                         let rebuilt = crate::config::build_resume_command(
@@ -2962,11 +2967,14 @@ fn handle_bookmark_picker_key(key: KeyEvent, ui: &mut UiState) -> KeyResult {
                         );
                         if rebuilt.contains("--resume") {
                             rebuilt
+                        } else if resumable {
+                            format!("copilot --resume {}", b.session_id)
                         } else {
-                            bare_resume
+                            base.to_string()
                         }
                     }
-                    _ => bare_resume,
+                    _ if resumable => format!("copilot --resume {}", b.session_id),
+                    _ => "copilot".to_string(),
                 };
                 return KeyResult::NewPane(NewPaneRequest {
                     dir: PathBuf::from(cwd),
@@ -8734,7 +8742,7 @@ mod tests {
         ui.mode = UiMode::BookmarkPicker;
         ui.bookmark_picker_index = 0;
         ui.bookmarks = vec![crate::bookmark::Bookmark {
-            session_id: "deadbeef-cafe-1234".to_string(),
+            session_id: "deadbeef-cafe-4321-8765-0123456789ab".to_string(),
             session_name: "my-feature-branch".to_string(),
             note: "investigating intermittent build failures in CI \
                    when bumping rustc — long descriptive paragraph"
@@ -8753,7 +8761,10 @@ mod tests {
                     req.name, "my-feature-branch",
                     "card name must be the bookmark's session_name, never the note"
                 );
-                assert_eq!(req.command, "copilot --resume deadbeef-cafe-1234");
+                assert_eq!(
+                    req.command,
+                    "copilot --resume deadbeef-cafe-4321-8765-0123456789ab"
+                );
             }
             other => panic!("Expected NewPane, got {:?}", other),
         }
@@ -8769,7 +8780,7 @@ mod tests {
         ui.mode = UiMode::BookmarkPicker;
         ui.bookmark_picker_index = 0;
         ui.bookmarks = vec![crate::bookmark::Bookmark {
-            session_id: "deadbeef-cafe-1234".to_string(),
+            session_id: "deadbeef-cafe-4321-8765-0123456789ab".to_string(),
             session_name: "funnel-data".to_string(),
             note: "funnel data investigation".to_string(),
             updated_at: Utc::now(),
@@ -8783,7 +8794,8 @@ mod tests {
         match result {
             KeyResult::NewPane(req) => {
                 assert_eq!(
-                    req.command, "agency copilot --allow-all --resume deadbeef-cafe-1234",
+                    req.command,
+                    "agency copilot --allow-all --resume deadbeef-cafe-4321-8765-0123456789ab",
                     "bookmark open must preserve the captured wrapper + --allow-all and append --resume"
                 );
             }
@@ -8802,7 +8814,7 @@ mod tests {
         ui.mode = UiMode::BookmarkPicker;
         ui.bookmark_picker_index = 0;
         ui.bookmarks = vec![crate::bookmark::Bookmark {
-            session_id: "deadbeef-cafe-1234".to_string(),
+            session_id: "deadbeef-cafe-4321-8765-0123456789ab".to_string(),
             session_name: "weird".to_string(),
             note: "non-simple command".to_string(),
             updated_at: Utc::now(),
@@ -8817,8 +8829,45 @@ mod tests {
         match result {
             KeyResult::NewPane(req) => {
                 assert_eq!(
-                    req.command, "copilot --resume deadbeef-cafe-1234",
+                    req.command, "copilot --resume deadbeef-cafe-4321-8765-0123456789ab",
                     "non-rewritable command must fall back to a bare resume, not launch raw"
+                );
+            }
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn open_bookmark_picker_non_uuid_id_opens_fresh_not_resume() {
+        // A bookmark whose session_id is a leaked non-session identifier
+        // (subagent/MCP id, not a UUID) must NOT be reopened with
+        // `--resume <that>` — the agent rejects it with "No session or name
+        // matched '…'". It should open the captured command fresh instead.
+        let mut ui = default_ui();
+        ui.mode = UiMode::BookmarkPicker;
+        ui.bookmark_picker_index = 0;
+        ui.bookmarks = vec![crate::bookmark::Bookmark {
+            session_id: "sidekick-github-context-memory-1783703040081".to_string(),
+            session_name: "funnel".to_string(),
+            note: "leaked id".to_string(),
+            updated_at: Utc::now(),
+            command: Some("agency copilot --allow-all".to_string()),
+            agent_type: Some(crate::event::AgentType::CopilotCli),
+        }];
+
+        let result =
+            handle_bookmark_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ui);
+
+        match result {
+            KeyResult::NewPane(req) => {
+                assert_eq!(
+                    req.command, "agency copilot --allow-all",
+                    "a non-UUID (leaked) session id must open the captured command fresh"
+                );
+                assert!(
+                    !req.command.contains("--resume"),
+                    "must not emit --resume for a non-resumable id (got {:?})",
+                    req.command
                 );
             }
             other => panic!("Expected NewPane, got {:?}", other),
@@ -8835,7 +8884,7 @@ mod tests {
         ui.mode = UiMode::BookmarkPicker;
         ui.bookmark_picker_index = 0;
         ui.bookmarks = vec![crate::bookmark::Bookmark {
-            session_id: "deadbeef-cafe-1234".to_string(),
+            session_id: "deadbeef-cafe-4321-8765-0123456789ab".to_string(),
             session_name: String::new(),
             note: "this is just a note, not a name".to_string(),
             updated_at: Utc::now(),
