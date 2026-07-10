@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use std::any::Any;
@@ -31,11 +30,6 @@ struct Pane {
     mouse_mode: Arc<AtomicBool>,
     /// Hyperlink URLs extracted from OSC 8 escape sequences, keyed by screen row.
     hyperlinks: Arc<Mutex<HyperlinkMap>>,
-    /// Unix-millisecond timestamp of the most recent non-empty PTY read from the
-    /// child process. Updated by the reader thread on every `Ok(n)` with `n > 0`
-    /// using `Relaxed` ordering — we only need monotonic-ish "agent emitted bytes
-    /// recently" semantics for the Pending-flicker heuristic, not strict ordering.
-    last_pty_byte_unix_ms: Arc<AtomicI64>,
 }
 
 /// Thread-safe pane registry.
@@ -220,19 +214,6 @@ impl EmbeddedPaneController {
             .is_some_and(|p| p.mouse_mode.load(Ordering::Relaxed))
     }
 
-    /// Timestamp of the most recent non-empty PTY read from the child process.
-    /// Returns `None` if the pane is unknown or if the stored unix-ms can't be
-    /// converted (shouldn't happen for any timestamp we actually write). Used by
-    /// the UI loop to bridge PTY-byte activity into `AppState::bump_pty_activity`
-    /// before each `apply_pending_timeout` so streaming-tokens sessions don't
-    /// false-positive into Pending during long LLM gaps.
-    pub fn last_pty_byte_at(&self, pane_id: &str) -> Option<DateTime<Utc>> {
-        let panes = self.panes.lock().unwrap();
-        let pane = panes.get(pane_id)?;
-        let ms = pane.last_pty_byte_unix_ms.load(Ordering::Relaxed);
-        DateTime::<Utc>::from_timestamp_millis(ms)
-    }
-
     /// Forward a mouse scroll event to the child app via SGR extended mouse encoding.
     /// Coordinates are pane-relative (0-indexed) and converted to 1-indexed for the protocol.
     /// Also resets vt100 scrollback to 0 so the terminal widget shows live output.
@@ -321,14 +302,12 @@ impl EmbeddedPaneController {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
-        let last_pty_byte_unix_ms = Arc::new(AtomicI64::new(Utc::now().timestamp_millis()));
 
         // Spawn a background thread to read PTY output and feed it to the vt100 parser.
         // Strips OSC 8 hyperlink sequences and records row → URL associations.
         let parser_clone = Arc::clone(&parser);
         let mouse_mode_clone = Arc::clone(&mouse_mode);
         let hyperlinks_clone = Arc::clone(&hyperlinks);
-        let last_pty_byte_unix_ms_clone = Arc::clone(&last_pty_byte_unix_ms);
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut osc8 = Osc8Filter::new();
@@ -337,11 +316,6 @@ impl EmbeddedPaneController {
                     Ok(0) => break,
                     Ok(n) => {
                         let data = &buf[..n];
-                        // Record that the agent emitted bytes right now. Cheap, lock-free.
-                        // Consumed by AppState::apply_pending_timeout via the UI-loop bridge
-                        // to keep streaming-tokens sessions from being flagged Pending.
-                        last_pty_byte_unix_ms_clone
-                            .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
                         scan_mouse_mode(data, &mouse_mode_clone);
 
                         let segments = osc8.process(data);
@@ -377,7 +351,6 @@ impl EmbeddedPaneController {
             command: command.map(|c| c.to_string()),
             mouse_mode,
             hyperlinks,
-            last_pty_byte_unix_ms,
         };
 
         self.panes.lock().unwrap().insert(pane_id.clone(), pane);

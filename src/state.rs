@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::config_validation::sanitize_role_name;
 use crate::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
@@ -15,13 +15,13 @@ const MAX_FIRST_PROMPTS: usize = 3;
 pub enum SessionStatus {
     Thinking,
     Working,
-    /// Agent appears to be waiting for non-permission user input (e.g.,
-    /// a clarifying multiple-choice prompt printed to its pane). Inferred
-    /// from a heuristic in `AppState::apply_pending_timeout`: when an
-    /// agent has been in `Working` long enough with no active tool and
-    /// no new events, it has almost certainly stalled at an interactive
-    /// prompt. Distinct from `WaitingForInput`, which is the explicit
-    /// permission-prompt state hooked from `PermissionRequest` events.
+    /// Agent is waiting for non-permission user input — specifically, an
+    /// interactive-prompt tool (Copilot CLI's `ask_user`, per
+    /// `INTERACTIVE_PROMPT_TOOL_NAMES`) is the active tool. Set the moment
+    /// that tool starts (see `apply_event`'s `ToolStart` arm), since such a
+    /// tool blocks on the user by definition. Distinct from `WaitingForInput`,
+    /// which is the explicit permission-prompt state hooked from
+    /// `PermissionRequest` events.
     Pending,
     Compacting,
     WaitingForInput,
@@ -57,18 +57,6 @@ pub struct SessionState {
     pub active_tool: Option<ActiveTool>,
     pub started_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
-    /// Most recent time the embedded PTY for this session emitted any
-    /// bytes from the agent. Updated out-of-band by the UI loop from
-    /// `EmbeddedPaneController::last_pty_byte_at` before each Pending
-    /// check; never bumped by `apply_event`. Display surfaces
-    /// ("Last: 5s ago", idle-art timer, workspace-restore preference)
-    /// deliberately keep using `last_activity` so they reflect
-    /// meaningful agent activity rather than every spinner tick.
-    ///
-    /// Initialised to `last_activity` so a session with no recorded
-    /// PTY traffic yet does not look artificially older than its hook
-    /// events.
-    pub last_pty_activity: DateTime<Utc>,
     pub recent_events: VecDeque<AgentEvent>,
     pub tool_count: u32,
     pub last_user_prompt: Option<String>,
@@ -81,14 +69,6 @@ pub struct SessionState {
     /// `Idle` prematurely. Saturating: never goes negative if events
     /// arrive in an unexpected order.
     pub active_subagent_count: u32,
-    /// Consecutive `apply_pending_timeout` checks where the session was
-    /// found stale (eligible AND `elapsed >= timeout`) without a Pending
-    /// flip having happened yet. Reset to 0 on any new event arriving
-    /// via `apply_event`, and reset to 0 immediately after a Pending
-    /// flip. The flip is gated on `strikes >= PENDING_CONFIRMATION_STRIKES`
-    /// so a one-shot LLM-thinking gap right at the timeout boundary
-    /// can't produce a visible Working → Pending → Working flicker.
-    pub pending_strikes: u32,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -168,13 +148,11 @@ impl AppState {
                 active_tool: None,
                 started_at,
                 last_activity: now,
-                last_pty_activity: now,
                 recent_events: VecDeque::new(),
                 tool_count: 0,
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 active_subagent_count: 0,
-                pending_strikes: 0,
                 pane_id: Some(pane_id),
             },
         );
@@ -186,20 +164,6 @@ impl AppState {
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
-    }
-
-    /// Record that the embedded PTY for `pane_id` emitted bytes from
-    /// the agent at `at`. Updates `last_pty_activity` on every session
-    /// bound to that pane (typically one) when `at` is more recent than
-    /// the stored value. Used by the UI loop to bridge the PTY reader
-    /// thread into the Pending-flip heuristic without changing the
-    /// hook-event-driven `last_activity` semantics that drive display.
-    pub fn bump_pty_activity(&mut self, pane_id: &str, at: DateTime<Utc>) {
-        for session in self.sessions.values_mut() {
-            if session.pane_id.as_deref() == Some(pane_id) && at > session.last_pty_activity {
-                session.last_pty_activity = at;
-            }
-        }
     }
 
     /// Handle a delegate signal from the orchestrator.
@@ -382,22 +346,15 @@ impl AppState {
                 active_tool: None,
                 started_at: pane_started.unwrap_or(event.timestamp),
                 last_activity: event.timestamp,
-                last_pty_activity: event.timestamp,
                 recent_events: VecDeque::new(),
                 tool_count: 0,
                 last_user_prompt: None,
                 first_prompts: Vec::new(),
                 active_subagent_count: 0,
-                pending_strikes: 0,
                 pane_id: event.pane_id.clone(),
             });
 
         session.last_activity = event.timestamp;
-        // Any event arriving for the session counts as activity — reset the
-        // Pending-confirmation counter. Without this, a `apply_pending_timeout`
-        // tick that previously banked a strike would still credit it the next
-        // time the session went quiet, defeating the multi-tick gate.
-        session.pending_strikes = 0;
 
         if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
             session.agent_type = event.agent_type.clone();
@@ -431,10 +388,9 @@ impl AppState {
                 if session.status != SessionStatus::WaitingForInput {
                     // An interactive-prompt tool (Copilot's `ask_user`) is,
                     // by definition, blocking on the user — so go straight to
-                    // Pending instead of Working. There is no reason to wait
-                    // out the `apply_pending_timeout` grace period for a case
-                    // we can detect deterministically: the moment the prompt
-                    // appears, the card should signal "needs you".
+                    // Pending instead of Working. We detect it deterministically,
+                    // so there's nothing to wait for: the moment the prompt
+                    // appears, the card signals "needs you".
                     let is_prompt = event
                         .tool_name
                         .as_deref()
@@ -544,203 +500,12 @@ impl AppState {
             session.recent_events.pop_front();
         }
     }
-
-    /// Walk every session and transition `Working` or `Thinking` → `Pending`
-    /// when the session has stalled for at least `timeout` without firing
-    /// any new event and without an active tool. This catches two cases:
-    ///
-    ///   1. **Post-tool stall**: agent fires `postToolUse`, then prints an
-    ///      interactive menu ("Did you mean 1, 2, or 3?") and waits on
-    ///      stdin without firing any further hook event. Status is
-    ///      `Working` at the time.
-    ///   2. **Thinking stall**: agent fires `userPromptSubmitted` (→
-    ///      `Thinking`) and then prints a clarifying question directly
-    ///      *without* going through a tool. Status stays `Thinking`
-    ///      indefinitely until the user responds.
-    ///
-    /// Both manifest in the dashboard as a frozen-looking spinner with no
-    /// active tool, which is what the heuristic keys on.
-    ///
-    /// Returns the set of session IDs that just transitioned so callers
-    /// can fire a bell or update other side-effects exactly once per
-    /// transition.
-    ///
-    /// **Clock-skew defence.** Uses wall-clock `Utc::now()` rather than a
-    /// monotonic source so a long laptop sleep, NTP correction, or manual
-    /// clock change can spike `signed_duration_since(last_activity)` to
-    /// arbitrarily large values. To prevent a barrage of false Pending
-    /// flips (and bell rings) on system resume, durations above
-    /// `CLOCK_SKEW_REJECTION_THRESHOLD` are treated as "the clock just
-    /// jumped, can't trust this" and skipped. The threshold is chosen
-    /// generously enough that no realistic timeout value would ever
-    /// exceed it.
-    ///
-    /// **By-design caveat.** The heuristic intentionally cannot distinguish
-    /// "agent is stuck at a non-hook prompt" from "agent is taking longer
-    /// than `timeout` to think/decide". Both look like
-    /// `status=Working|Thinking AND active_tool=None`. The default 30 s
-    /// timeout is generous enough for typical LLM gaps; if a user runs
-    /// into the false-positive case (very long Thinking on complex
-    /// prompts) they can tune `pending.timeout_seconds` up or set it to
-    /// 0 to disable the heuristic entirely.
-    ///
-    /// **Confirmation gate.** Even with a generous timeout, a single
-    /// LLM gap right at the timeout boundary used to produce a visible
-    /// Working → Pending → Working flicker. To eliminate that, a session
-    /// must be observed stale on `PENDING_CONFIRMATION_STRIKES`
-    /// consecutive calls (≈one call per second from `ui.rs`) before the
-    /// flip actually fires. Any new event resets the strike counter via
-    /// `apply_event`, so true silence is the only thing that accumulates
-    /// strikes.
-    pub fn apply_pending_timeout(&mut self, timeout: chrono::Duration) -> Vec<String> {
-        let now = Utc::now();
-        let mut transitioned = Vec::new();
-        for (sid, session) in self.sessions.iter_mut() {
-            // Both Working and Thinking are bell-eligible: Working catches
-            // the post-tool-stall case, Thinking catches the
-            // clarifying-question-without-tool case.
-            if !matches!(
-                session.status,
-                SessionStatus::Working | SessionStatus::Thinking
-            ) {
-                // Other statuses are by design ineligible (Idle, Pending
-                // itself, WaitingForInput, Compacting, Error). Skipping
-                // silently — those are the common case, no diagnostic
-                // value in logging them. Also reset strikes so a session
-                // that re-enters Working/Thinking later starts fresh.
-                session.pending_strikes = 0;
-                continue;
-            }
-            // Compute elapsed early so we can include it in skip logs.
-            // Use the more recent of the hook-event-driven `last_activity`
-            // and the PTY-byte-driven `last_pty_activity` so a session
-            // that is streaming response tokens (no hook events firing,
-            // but bytes flowing) does not flip to Pending mid-stream.
-            let effective_last = session.last_activity.max(session.last_pty_activity);
-            let elapsed = now.signed_duration_since(effective_last);
-            let elapsed_ms = elapsed.num_milliseconds();
-
-            if let Some(ref tool) = session.active_tool {
-                // Most active tools are legitimate work (Bash, Edit,
-                // long-running searches). Skipping when one is running
-                // prevents false-positive Pending on those.
-                //
-                // EXCEPT: Copilot CLI implements clarifying questions
-                // ("Did you mean 1, 2, or 3?") as a tool called
-                // `ask_user` that blocks until the user picks an
-                // option. From the gate's perspective the session looks
-                // like a long-running tool, but it's actually waiting
-                // on the user — the *exact* case Pending exists to
-                // surface. Treat known interactive-prompt tool names
-                // as Pending-eligible despite being "active", and let
-                // the normal elapsed-timeout check decide.
-                if !is_interactive_prompt_tool(&tool.name) {
-                    info!(
-                        session_id = %sid,
-                        status = ?session.status,
-                        elapsed_ms,
-                        active_tool = %tool.name,
-                        "pending_check skipped: active_tool"
-                    );
-                    session.pending_strikes = 0;
-                    continue;
-                }
-            }
-            // Background subagents are legitimate work — don't false-positive
-            // them into Pending. The parent agent simply hasn't fired events
-            // because it's waiting on subagents to finish.
-            if session.active_subagent_count > 0 {
-                info!(
-                    session_id = %sid,
-                    status = ?session.status,
-                    elapsed_ms,
-                    subagent_count = session.active_subagent_count,
-                    "pending_check skipped: active subagents"
-                );
-                session.pending_strikes = 0;
-                continue;
-            }
-            // Reject negative (clock went backward) and absurdly large
-            // values (clock jumped forward — sleep/NTP/manual change).
-            if elapsed < chrono::Duration::zero() || elapsed > CLOCK_SKEW_REJECTION_THRESHOLD {
-                info!(
-                    session_id = %sid,
-                    status = ?session.status,
-                    elapsed_ms,
-                    "pending_check skipped: clock skew rejected"
-                );
-                session.pending_strikes = 0;
-                continue;
-            }
-            if elapsed >= timeout {
-                session.pending_strikes = session.pending_strikes.saturating_add(1);
-                if session.pending_strikes >= PENDING_CONFIRMATION_STRIKES {
-                    info!(
-                        session_id = %sid,
-                        from_status = ?session.status,
-                        elapsed_ms,
-                        timeout_ms = timeout.num_milliseconds(),
-                        strikes = session.pending_strikes,
-                        active_tool = %session.active_tool.as_ref().map(|t| t.name.as_str()).unwrap_or(""),
-                        "pending_check fired: transitioning to Pending"
-                    );
-                    session.status = SessionStatus::Pending;
-                    session.pending_strikes = 0;
-                    transitioned.push(sid.clone());
-                } else {
-                    info!(
-                        session_id = %sid,
-                        status = ?session.status,
-                        elapsed_ms,
-                        timeout_ms = timeout.num_milliseconds(),
-                        strikes = session.pending_strikes,
-                        required = PENDING_CONFIRMATION_STRIKES,
-                        "pending_check banked strike: waiting for confirmation"
-                    );
-                }
-            } else {
-                // Below the timeout — a fresh-enough event has arrived.
-                // Drop any banked strike so the next stall starts from zero.
-                session.pending_strikes = 0;
-                info!(
-                    session_id = %sid,
-                    status = ?session.status,
-                    elapsed_ms,
-                    timeout_ms = timeout.num_milliseconds(),
-                    active_tool = %session.active_tool.as_ref().map(|t| t.name.as_str()).unwrap_or(""),
-                    "pending_check waiting: eligible but below timeout"
-                );
-            }
-        }
-        transitioned
-    }
 }
 
-/// Number of consecutive `apply_pending_timeout` checks during which a
-/// session must be observed stale (eligible AND `elapsed >= timeout`)
-/// before the Working → Pending flip actually fires. Because the caller
-/// in `ui.rs` invokes this roughly once per second, the value is also
-/// the additional seconds of grace beyond `pending.timeout_seconds`.
-///
-/// Set to `2` to eliminate the single-tick LLM-thinking-gap flicker
-/// (Working → Pending → Working on the same render cycle) without
-/// noticeably delaying a real stall — a stuck agent still flips within
-/// `timeout + ~1 s`.
-const PENDING_CONFIRMATION_STRIKES: u32 = 2;
-
-/// Maximum trusted elapsed-time-since-last-activity that
-/// `apply_pending_timeout` will act on. Values above this are taken as
-/// evidence the system clock jumped (laptop sleep, NTP, manual clock
-/// change) rather than as a real measurement, and the heuristic skips
-/// the session to avoid firing a flood of false Pending flips on system
-/// resume. 24 h is large enough that no realistic `pending.timeout_seconds`
-/// value would be missed by this guard.
-const CLOCK_SKEW_REJECTION_THRESHOLD: chrono::Duration = chrono::Duration::hours(24);
-
-/// Known agent tool names whose entire purpose is to block on user
-/// input. When one of these is the active tool, `apply_pending_timeout`
-/// treats the session as Pending-eligible (despite an active tool)
-/// because the user's attention is exactly what the tool is waiting for.
+/// Known agent tool names whose entire purpose is to block on user input.
+/// When one of these starts (see `apply_event`'s `ToolStart` arm) the session
+/// goes straight to `Pending`, because the user's attention is exactly what the
+/// tool is waiting for.
 ///
 /// Match is case-insensitive on the tool name only. Currently observed:
 ///
@@ -1716,128 +1481,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pending status: Working → Pending heuristic
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn pending_timeout_flips_stale_working_session_to_pending() {
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        // Tool finished — active_tool cleared, status still Working.
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-        assert!(state.sessions["s1"].active_tool.is_none());
-
-        // Force last_activity into the past so the timeout matches.
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        // First check banks a strike but does NOT flip — the confirmation
-        // gate suppresses single-tick LLM-gap flicker. Second check (no
-        // intervening event to reset strikes) crosses the threshold.
-        let first = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(first.is_empty());
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-        let second = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert_eq!(second, vec!["s1".to_string()]);
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
-    }
-
-    #[test]
-    fn pending_timeout_skips_sessions_with_active_tool() {
-        // A genuinely long-running tool (e.g., `cargo test`) keeps active_tool
-        // set throughout — the timeout must not flip it to Pending.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
-        tool.tool_name = Some("Bash".into());
-        state.apply_event(tool);
-        // Push activity back so the duration check would otherwise trigger.
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(60);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(60);
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(transitioned.is_empty());
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-    }
-
-    #[test]
-    fn pending_timeout_ignores_non_eligible_statuses() {
-        // Idle, WaitingForInput, Compacting, Error all stay — only
-        // Working and Thinking are eligible to transition to Pending
-        // (those are the two states that show as "agent is processing
-        // but no tool is actively running" in the UI, which is where a
-        // non-hook stall manifests). Pending itself is also excluded
-        // so a repeated apply doesn't oscillate.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        // Force last_activity into the past.
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(60);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(60);
-        for status in [
-            SessionStatus::Idle,
-            SessionStatus::WaitingForInput,
-            SessionStatus::Compacting,
-            SessionStatus::Error,
-            SessionStatus::Pending,
-        ] {
-            state.sessions.get_mut("s1").unwrap().status = status.clone();
-            let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-            assert!(
-                transitioned.is_empty(),
-                "should not transition from {status:?}"
-            );
-            assert_eq!(state.sessions["s1"].status, status);
-        }
-    }
-
-    #[test]
-    fn pending_timeout_flips_stale_thinking_session_to_pending() {
-        // Regression guard for the Copilot CLI clarifying-question case:
-        // when the agent fires userPromptSubmitted (→ Thinking) and then
-        // prints a clarifying menu directly without going through a
-        // tool, status stays Thinking until the user responds. The
-        // heuristic must catch this stall too, not only the
-        // post-tool variant.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::Thinking, "p1"));
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Thinking);
-        assert!(state.sessions["s1"].active_tool.is_none());
-
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        // Two consecutive checks needed (confirmation gate).
-        assert!(
-            state
-                .apply_pending_timeout(chrono::Duration::seconds(10))
-                .is_empty()
-        );
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert_eq!(transitioned, vec!["s1".to_string()]);
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
-    }
+    // Pending status: ask_user → Pending (event-level)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn ask_user_tool_goes_pending_immediately() {
         // Copilot CLI's clarifying-question pattern presents as an active tool
         // named `ask_user` that blocks until the user picks an option. Because
         // that *definitionally* means "waiting on the user", the card goes
-        // straight to Pending the moment the prompt appears — no
-        // apply_pending_timeout grace period, and independent of any TUI
-        // repaint chrome bumping last_pty_activity.
+        // straight to Pending the moment the prompt appears.
         let mut state = AppState::default();
         state.register_pane("p1".into());
         state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
@@ -1889,61 +1542,19 @@ mod tests {
     }
 
     #[test]
-    fn pending_timeout_still_skips_normal_active_tool() {
-        // Regression guard for the interactive-prompt special case:
-        // non-interactive tools (Bash, Edit, etc.) must still skip the
-        // gate, otherwise every long-running tool would false-positive
-        // into Pending.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
-        tool.tool_name = Some("Bash".into());
-        state.apply_event(tool);
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(60);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(60);
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(transitioned.is_empty());
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-    }
-
-    #[test]
-    fn pending_timeout_below_threshold_does_not_fire() {
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-        // last_activity is recent — duration is well under 10s.
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(transitioned.is_empty());
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-    }
-
-    #[test]
     fn pending_clears_when_new_event_arrives() {
         let mut state = AppState::default();
         state.register_pane("p1".into());
         state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        // Two consecutive checks needed (confirmation gate).
-        state.apply_pending_timeout(chrono::Duration::seconds(10));
-        state.apply_pending_timeout(chrono::Duration::seconds(10));
+
+        let mut ask_user = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        ask_user.tool_name = Some("ask_user".into());
+        state.apply_event(ask_user);
         assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
 
-        // User answers the prompt; agent fires another tool call.
         let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
         tool.tool_name = Some("Read".into());
         state.apply_event(tool);
-        // ToolStart while status was Pending now drives back to Working.
-        // (status != WaitingForInput, so the existing guard lets it through.)
         assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
     }
 
@@ -1952,158 +1563,15 @@ mod tests {
         let mut state = AppState::default();
         state.register_pane("p1".into());
         state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        // Two consecutive checks needed (confirmation gate).
-        state.apply_pending_timeout(chrono::Duration::seconds(10));
-        state.apply_pending_timeout(chrono::Duration::seconds(10));
+
+        let mut ask_user = make_event_with_pane("s1", EventType::ToolStart, "p1");
+        ask_user.tool_name = Some("ask_user".into());
+        state.apply_event(ask_user);
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
 
         let stats = state.aggregate_stats();
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.working, 0);
-    }
-
-    #[test]
-    fn pending_confirmation_gate_suppresses_single_tick_flicker() {
-        // Regression guard for the user-visible "card briefly flips to
-        // Pending then back to Working" flicker. The scenario:
-        //   1. Working session has a >timeout LLM gap (no events arrive).
-        //   2. apply_pending_timeout fires — session is eligible AND stale.
-        //   3. The agent then emits a fresh event before the *next* check.
-        //
-        // Before this fix the first check flipped status to Pending,
-        // producing a one-render flash. With the strike gate, the first
-        // check only banks a strike (status stays Working), the fresh
-        // event resets the strike, and the user never sees Pending.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        // First check: stale, but only one strike — no flip yet.
-        let first = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(
-            first.is_empty(),
-            "single-tick staleness must NOT flip to Pending"
-        );
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-        assert_eq!(state.sessions["s1"].pending_strikes, 1);
-
-        // Agent emits a fresh tool — this is the case the gate protects
-        // against. The banked strike must be cleared.
-        let mut tool = make_event_with_pane("s1", EventType::ToolStart, "p1");
-        tool.tool_name = Some("Read".into());
-        state.apply_event(tool);
-        assert_eq!(state.sessions["s1"].pending_strikes, 0);
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-    }
-
-    #[test]
-    fn pending_strikes_reset_when_status_leaves_eligible() {
-        // If the session transitions out of Working/Thinking between
-        // strike-banking checks (e.g., a permission prompt arrives), the
-        // accumulated strikes must be cleared so the next stale Working
-        // period starts the gate from zero.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(30);
-        // Bank one strike while Working.
-        state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert_eq!(state.sessions["s1"].pending_strikes, 1);
-
-        // Session pivots out of eligible status (e.g., permission prompt).
-        state.sessions.get_mut("s1").unwrap().status = SessionStatus::WaitingForInput;
-        // Next check: ineligible — strikes must be reset, not retained.
-        state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert_eq!(state.sessions["s1"].pending_strikes, 0);
-    }
-
-    #[test]
-    fn pending_timeout_skips_negative_elapsed_from_clock_going_backward() {
-        // If the system clock moved backward (NTP correction, manual
-        // change), `signed_duration_since(last_activity)` returns a
-        // negative value. The guard must skip these sessions rather than
-        // pass the >= timeout check on negative numbers (chrono does the
-        // sane thing here, but we want explicit coverage of the case).
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-        // last_activity in the future = clock moved backward.
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() + chrono::Duration::seconds(60);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() + chrono::Duration::seconds(60);
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(transitioned.is_empty());
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-    }
-
-    #[test]
-    fn pending_timeout_skips_implausibly_large_elapsed_from_laptop_sleep() {
-        // Regression guard against the user-facing bug "every Working
-        // session fires Pending on laptop resume". After a multi-hour
-        // sleep, `Utc::now()` jumps forward and every session looks
-        // ancient — but the right action is to skip them entirely
-        // (treat as "clock just jumped") rather than fire a barrage of
-        // bells the user will find at 9am.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-        // Simulate ~48h of laptop sleep.
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::hours(48);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::hours(48);
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(
-            transitioned.is_empty(),
-            "48h elapsed should be treated as clock skew, not as a real Pending stall"
-        );
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-    }
-
-    #[test]
-    fn pending_timeout_fires_at_boundary_just_under_clock_skew_threshold() {
-        // The skew rejection must not be so aggressive that it eats real
-        // long timeouts. A session that's been Working for 23 hours with
-        // a 23h timeout should still fire — we only skip *above* the
-        // 24h threshold.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::hours(23);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::hours(23);
-        // Two consecutive checks needed (confirmation gate).
-        assert!(
-            state
-                .apply_pending_timeout(chrono::Duration::hours(22))
-                .is_empty()
-        );
-        let transitioned = state.apply_pending_timeout(chrono::Duration::hours(22));
-        assert_eq!(transitioned, vec!["s1".to_string()]);
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
     }
 
     // -----------------------------------------------------------------------
@@ -2231,28 +1699,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_timeout_skips_sessions_with_active_subagents() {
-        // Regression: a session that's only "Working" because of background
-        // subagents must not be mis-flipped to Pending after the timeout.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::SubagentStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::Idle, "p1"));
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-
-        // Force last_activity into the past so the timeout would otherwise
-        // trigger.
-        state.sessions.get_mut("s1").unwrap().last_activity =
-            Utc::now() - chrono::Duration::seconds(60);
-        state.sessions.get_mut("s1").unwrap().last_pty_activity =
-            Utc::now() - chrono::Duration::seconds(60);
-        let transitioned = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(transitioned.is_empty());
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-    }
-
-    #[test]
     fn idle_event_preserves_waiting_for_input_even_with_subagents() {
         // Bug guard: a permission prompt (WaitingForInput) must survive an
         // Idle event arriving from the parent agent's turn-end. Before the
@@ -2354,93 +1800,5 @@ mod tests {
         let mut ev = make_event(session_id, event_type);
         ev.pane_id = Some(pane_id.to_string());
         ev
-    }
-
-    #[test]
-    fn pending_timeout_skipped_by_recent_last_pty_activity() {
-        // last_activity is stale (60s ago) so the hook-event clock has
-        // crossed the timeout, but last_pty_activity is fresh (1s ago) —
-        // the agent is streaming response tokens. apply_pending_timeout
-        // must use max(last_activity, last_pty_activity) and treat the
-        // session as still working.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-
-        let now = Utc::now();
-        {
-            let s = state.sessions.get_mut("s1").unwrap();
-            s.last_activity = now - chrono::Duration::seconds(60);
-            s.last_pty_activity = now - chrono::Duration::seconds(1);
-        }
-
-        // Two consecutive ticks would normally cross the strike gate,
-        // but the PTY-byte freshness suppresses both.
-        let first = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(first.is_empty());
-        let second = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(second.is_empty());
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Working);
-    }
-
-    #[test]
-    fn pending_timeout_fires_when_both_last_activity_and_pty_are_stale() {
-        // last_activity AND last_pty_activity both 60s ago — no streaming,
-        // no hook events. Genuine stall; must flip after the strike gate.
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolStart, "p1"));
-        state.apply_event(make_event_with_pane("s1", EventType::ToolEnd, "p1"));
-
-        let now = Utc::now();
-        {
-            let s = state.sessions.get_mut("s1").unwrap();
-            s.last_activity = now - chrono::Duration::seconds(60);
-            s.last_pty_activity = now - chrono::Duration::seconds(60);
-        }
-
-        let first = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert!(first.is_empty()); // strike #1
-        let second = state.apply_pending_timeout(chrono::Duration::seconds(10));
-        assert_eq!(second, vec!["s1".to_string()]); // strike #2 → flip
-        assert_eq!(state.sessions["s1"].status, SessionStatus::Pending);
-    }
-
-    #[test]
-    fn bump_pty_activity_only_updates_sessions_bound_to_pane() {
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.register_pane("p2".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-        state.apply_event(make_event_with_pane("s2", EventType::SessionStart, "p2"));
-
-        let baseline = Utc::now() - chrono::Duration::seconds(120);
-        for s in state.sessions.values_mut() {
-            s.last_pty_activity = baseline;
-        }
-
-        let bump_to = Utc::now();
-        state.bump_pty_activity("p1", bump_to);
-
-        // s1 bound to p1 — bumped. s2 bound to p2 — untouched.
-        assert_eq!(state.sessions["s1"].last_pty_activity, bump_to);
-        assert_eq!(state.sessions["s2"].last_pty_activity, baseline);
-    }
-
-    #[test]
-    fn bump_pty_activity_never_goes_backward() {
-        let mut state = AppState::default();
-        state.register_pane("p1".into());
-        state.apply_event(make_event_with_pane("s1", EventType::SessionStart, "p1"));
-
-        let now = Utc::now();
-        state.sessions.get_mut("s1").unwrap().last_pty_activity = now;
-
-        // Try to bump backward — must be a no-op (only `at > current` updates).
-        state.bump_pty_activity("p1", now - chrono::Duration::seconds(30));
-        assert_eq!(state.sessions["s1"].last_pty_activity, now);
     }
 }

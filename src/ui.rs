@@ -3640,36 +3640,6 @@ pub fn run_tui(
             ui.status_message = None;
         }
 
-        // Flip Working → Pending for sessions stalled at an interactive
-        // prompt with no corresponding hook event (typical Copilot CLI
-        // "1/2/3 — pick one" case). The transition takes a write lock
-        // and is gated to once per ~second; skipped when the configured
-        // timeout is 0 (feature disabled).
-        let pending_timeout_secs = ui.config.pending.timeout_seconds;
-        if pending_timeout_secs > 0 && tick.is_multiple_of(60) {
-            let timeout = chrono::Duration::seconds(pending_timeout_secs as i64);
-            // Bridge raw PTY-byte timestamps from the embedded controller into
-            // state before the heuristic runs. Streaming-tokens sessions emit
-            // bytes constantly even when hook events are sparse; without this
-            // bridge they false-positive into Pending during long LLM gaps.
-            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
-                let mut st = state.blocking_write();
-                let pane_ids: std::collections::HashSet<String> = st
-                    .sessions
-                    .values()
-                    .filter_map(|s| s.pane_id.clone())
-                    .collect();
-                for pid in pane_ids {
-                    if let Some(dt) = embedded.last_pty_byte_at(&pid) {
-                        st.bump_pty_activity(&pid, dt);
-                    }
-                }
-                let _ = st.apply_pending_timeout(timeout);
-            } else {
-                let _ = state.blocking_write().apply_pending_timeout(timeout);
-            }
-        }
-
         let snapshot = state.blocking_read().clone();
 
         // Route new Bash commands through mode tabs for reactive panes.
@@ -7942,13 +7912,11 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
-            last_pty_activity: Utc::now(),
             recent_events: events,
             tool_count: 0,
             last_user_prompt: None,
             first_prompts: Vec::new(),
             active_subagent_count: 0,
-            pending_strikes: 0,
             pane_id: None,
         };
 
@@ -9026,13 +8994,11 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
-            last_pty_activity: Utc::now(),
             recent_events: std::collections::VecDeque::new(),
             tool_count: 0,
             last_user_prompt: None,
             first_prompts: Vec::new(),
             active_subagent_count: 0,
-            pending_strikes: 0,
             pane_id: None,
         }
     }
@@ -9446,13 +9412,11 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
-            last_pty_activity: Utc::now(),
             recent_events: events,
             tool_count: 0,
             last_user_prompt: Some("third prompt".to_string()),
             first_prompts: Vec::new(),
             active_subagent_count: 0,
-            pending_strikes: 0,
             pane_id: None,
         };
 
@@ -9481,13 +9445,11 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
-            last_pty_activity: Utc::now(),
             recent_events: VecDeque::new(),
             tool_count: 0,
             last_user_prompt: Some("old prompt".to_string()),
             first_prompts: Vec::new(),
             active_subagent_count: 0,
-            pending_strikes: 0,
             pane_id: None,
         };
 
@@ -9507,13 +9469,11 @@ mod tests {
             active_tool: None,
             started_at: Utc::now(),
             last_activity: Utc::now(),
-            last_pty_activity: Utc::now(),
             recent_events: VecDeque::new(),
             tool_count: 0,
             last_user_prompt: None,
             first_prompts: Vec::new(),
             active_subagent_count: 0,
-            pending_strikes: 0,
             pane_id: None,
         };
 
@@ -10955,13 +10915,11 @@ mod tests {
                     active_tool: None,
                     started_at: Utc::now(),
                     last_activity: Utc::now(),
-                    last_pty_activity: Utc::now(),
                     recent_events: std::collections::VecDeque::new(),
                     tool_count: 0,
                     last_user_prompt: None,
                     first_prompts: Vec::new(),
                     active_subagent_count: 0,
-                    pending_strikes: 0,
                     pane_id: Some(orchestrator_pane.clone()),
                 },
             );
@@ -11030,13 +10988,11 @@ mod tests {
                     active_tool: None,
                     started_at: Utc::now(),
                     last_activity: Utc::now(),
-                    last_pty_activity: Utc::now(),
                     recent_events: std::collections::VecDeque::new(),
                     tool_count: 0,
                     last_user_prompt: None,
                     first_prompts: Vec::new(),
                     active_subagent_count: 0,
-                    pending_strikes: 0,
                     pane_id: Some(orchestrator_pane.clone()),
                 },
             );
